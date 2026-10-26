@@ -1,0 +1,16 @@
+{
+  "name": "tunnelka",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "fetch-core": "node scripts/fetch-singbox.mjs",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "pack-extension": "node scripts/pack-extension.mjs",
+    "test": "cargo test -p tunnelka-core"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

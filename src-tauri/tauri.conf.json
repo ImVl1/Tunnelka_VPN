@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tunnelka",
+  "version": "1.0.0",
+  "identifier": "app.tunnelka.client",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tunnelka",
+        "width": 1060,
+        "height": 720,
+        "minWidth": 880,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "Tunnelka",
+    "shortDescription": "VPN-клиент с поддержкой подписок",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/sing-box.exe": "core/sing-box.exe",
+      "resources/xray.exe": "core/xray.exe",
+      "resources/geosite-category-ru.srs": "core/geosite-category-ru.srs",
+      "resources/geoip-ru.srs": "core/geoip-ru.srs"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": [
+          "Russian",
+          "English"
+        ],
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

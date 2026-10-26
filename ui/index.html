@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tunnelka</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <aside class="side">
+    <div class="brand">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><path d="M10 50V40a22 22 0 0 1 44 0v10" /><path d="M20 50v-9a12 12 0 0 1 24 0v9" /><path d="M6 52h52" /></svg>
+      <span>Tunnelka</span>
+    </div>
+    <nav>
+      <button data-view="home" class="active">Подключение</button>
+      <button data-view="servers">Серверы и подписки</button>
+      <button data-view="split">Раздельное туннелирование</button>
+      <button data-view="settings">Настройки</button>
+      <button data-view="logs">Журнал</button>
+    </nav>
+    <div class="side-foot" id="side-status">Не подключено</div>
+  </aside>
+
+  <main>
+    <!-- Подключение -->
+    <section id="view-home" class="view active">
+      <div class="home">
+        <button id="power" class="arch" aria-label="Подключить">
+          <svg viewBox="0 0 240 170" aria-hidden="true">
+            <path class="ring r1" d="M20 160V120a100 100 0 0 1 200 0v40" />
+            <path class="ring r2" d="M55 160v-38a65 65 0 0 1 130 0v38" />
+            <path class="ring r3" d="M90 160v-36a30 30 0 0 1 60 0v36" />
+            <path class="ground" d="M8 164h224" />
+          </svg>
+        </button>
+        <h1 id="state-title">Не подключено</h1>
+        <p id="state-sub" class="muted">Нажмите на тоннель, чтобы подключиться</p>
+
+        <div class="stats" id="stats" hidden>
+          <div><span class="muted">Время</span><b id="uptime">00:00:00</b></div>
+          <div><span class="muted">Загрузка</span><b id="down">0 Б/с</b></div>
+          <div><span class="muted">Отдача</span><b id="up">0 Б/с</b></div>
+        </div>
+
+        <button class="current" id="current-server">
+          <span class="muted">Сервер</span>
+          <b id="current-name">Не выбран</b>
+        </button>
+
+        <div class="seg" role="radiogroup" aria-label="Режим">
+          <button data-mode="tun">TUN — весь трафик</button>
+          <button data-mode="proxy">Системный прокси</button>
+        </div>
+        <p class="hint" id="mode-hint"></p>
+      </div>
+    </section>
+
+    <!-- Серверы -->
+    <section id="view-servers" class="view">
+      <header class="view-head">
+        <h2>Серверы и подписки</h2>
+        <button class="ghost" id="update-all">Обновить все</button>
+      </header>
+      <div class="add-box">
+        <textarea id="add-input" rows="2" placeholder="Ссылка на подписку (https://…) или ссылки vless://, vmess://, trojan://, ss://, hy2://, tuic://"></textarea>
+        <div class="row">
+          <button class="primary" id="add-btn">Добавить</button>
+          <button class="ghost" id="paste-btn">Вставить из буфера</button>
+        </div>
+      </div>
+      <div class="tabs" id="sub-tabs"></div>
+      <div id="sub-card"></div>
+      <div class="list" id="server-list"></div>
+    </section>
+
+    <!-- Раздельное туннелирование -->
+    <section id="view-split" class="view">
+      <header class="view-head">
+        <h2>Раздельное туннелирование</h2>
+        <button class="primary" id="split-save">Сохранить</button>
+      </header>
+
+      <div class="block">
+        <h3>Приложения</h3>
+        <div class="radios" id="app-mode">
+          <label><input type="radio" name="app_mode" value="off" /> Не разделять по приложениям</label>
+          <label><input type="radio" name="app_mode" value="exclude" /> Все через VPN, кроме выбранных</label>
+          <label><input type="radio" name="app_mode" value="include" /> Через VPN только выбранные</label>
+        </div>
+        <div class="chips" id="apps"></div>
+        <div class="row">
+          <input id="app-input" placeholder="chrome.exe, C:\Games\game.exe или папка C:\Games\" />
+          <button class="ghost" id="app-add">Добавить</button>
+          <button class="ghost" id="app-pick">Выбрать из запущенных</button>
+        </div>
+        <p class="hint">Имя программы совпадает с именем .exe. Папка с «\» на конце захватывает все программы внутри.</p>
+      </div>
+
+      <div class="block two">
+        <div>
+          <h3>Сайты через VPN</h3>
+          <textarea id="proxy-domains" rows="8" placeholder="youtube.com&#10;googlevideo.com&#10;instagram.com"></textarea>
+        </div>
+        <div>
+          <h3>Сайты напрямую</h3>
+          <textarea id="direct-domains" rows="8" placeholder="gosuslugi.ru&#10;keyword:bank&#10;192.168.50.0/24"></textarea>
+        </div>
+      </div>
+      <p class="hint">По одному на строку. Домен включает поддомены. Можно указывать IP и подсети, <code>full:</code>, <code>keyword:</code>, <code>regexp:</code>. Правила для сайтов важнее правил для приложений.</p>
+
+      <div class="block">
+        <label class="check"><input type="checkbox" id="ru-direct" /> Российские сайты и IP-адреса напрямую (.ru, .рф, .su и базы geosite/geoip)</label>
+        <p class="hint">Локальная сеть всегда идёт напрямую. После сохранения подключение перезапустится.</p>
+      </div>
+    </section>
+
+    <!-- Настройки -->
+    <section id="view-settings" class="view">
+      <header class="view-head">
+        <h2>Настройки</h2>
+        <button class="primary" id="settings-save">Сохранить</button>
+      </header>
+      <div class="form">
+        <label>DNS через VPN<input id="s-dns-remote" /></label>
+        <label>DNS напрямую<input id="s-dns-direct" /></label>
+        <label>Локальный прокси (HTTP/SOCKS5)<input id="s-mixed" type="number" /></label>
+        <label>Порт для расширения браузера<input id="s-ext" type="number" /></label>
+        <label>Порт API расширения<input id="s-api" type="number" /></label>
+        <label>Порт Clash API ядра<input id="s-clash" type="number" /></label>
+        <label>Ядро для VLESS / VMess / Trojan
+          <select id="s-core">
+            <option value="auto">Авто: sing-box, Xray для XHTTP</option>
+            <option value="xray">Всегда Xray-core</option>
+          </select>
+        </label>
+        <label>Первый порт Xray (по одному на сервер)<input id="s-xray-port" type="number" /></label>
+        <label>User-Agent для подписок<input id="s-ua" /></label>
+        <label>Подробность журнала
+          <select id="s-log"><option>error</option><option>warn</option><option>info</option><option>debug</option></select>
+        </label>
+        <label class="check"><input type="checkbox" id="s-ipv6" /> Использовать IPv6</label>
+        <label class="check"><input type="checkbox" id="s-lan" /> Разрешить подключения из локальной сети</label>
+        <label class="check"><input type="checkbox" id="s-auto" /> Подключаться при запуске</label>
+      </div>
+
+      <div class="block">
+        <h3>Расширение для Chrome</h3>
+        <p class="muted">Вставьте эти данные в настройки расширения, режим «Через приложение».</p>
+        <div class="pair">
+          <div><span class="muted">Порт API</span><b id="pair-port"></b></div>
+          <div><span class="muted">Токен</span><code id="pair-token"></code></div>
+        </div>
+        <div class="row">
+          <button class="ghost" id="copy-token">Скопировать токен</button>
+          <button class="ghost" id="new-token">Создать новый токен</button>
+        </div>
+        <p class="hint">Изменение порта API вступит в силу после перезапуска приложения.</p>
+      </div>
+    </section>
+
+    <!-- Журнал -->
+    <section id="view-logs" class="view">
+      <header class="view-head">
+        <h2>Журнал</h2>
+        <button class="ghost" id="logs-clear">Очистить</button>
+      </header>
+      <pre id="log-box"></pre>
+    </section>
+  </main>
+
+  <dialog id="proc-dialog">
+    <form method="dialog">
+      <h3>Запущенные программы</h3>
+      <input id="proc-filter" placeholder="Поиск" />
+      <div id="proc-list" class="proc-list"></div>
+      <div class="row end"><button class="ghost" value="close">Готово</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
