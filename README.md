@@ -43,16 +43,6 @@ VPN-клиент для Windows в духе Hiddify / v2RayTun / Happ: подп�
 
 ## Установка
 
-### Готовый установщик через GitHub (проще всего)
-
-Подробная инструкция для браузера — в файле [GITHUB.md](GITHUB.md).
-
-1. Создайте репозиторий на GitHub и загрузите туда эту папку.
-2. Откройте вкладку **Actions** → workflow **Build** → дождитесь окончания (≈10 минут).
-3. Скачайте артефакт `tunnelka-windows`: в нём установщик `Tunnelka_1.0.0_x64-setup.exe` и `tunnelka-extension.zip`.
-
-Чтобы получить релиз со ссылкой на скачивание, создайте тег: `git tag v1.0.0 && git push --tags`.
-
 ### Сборка на своём компьютере с Windows
 
 Нужны [Rust](https://rustup.rs), [Node.js 20+](https://nodejs.org) и Visual Studio Build Tools (рабочая нагрузка «Разработка классических приложений на C++»). WebView2 уже есть в Windows 10/11.
