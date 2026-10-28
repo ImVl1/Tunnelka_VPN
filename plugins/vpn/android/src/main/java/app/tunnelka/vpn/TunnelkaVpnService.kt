@@ -40,6 +40,13 @@ class TunnelkaVpnService : VpnService() {
         var running = false
             private set
 
+        /** Сервис запущен и библиотека туннеля работает. */
+        fun alive(): Boolean = running && try {
+            TProxyService.TProxyIsRunning()
+        } catch (_: Throwable) {
+            false
+        }
+
         @Volatile
         var lastError: String? = null
             private set
@@ -140,11 +147,16 @@ class TunnelkaVpnService : VpnService() {
             |  log-level: warn
             |""".trimMargin()
         )
+        // Файл доступен только приложению. Библиотека читает его в своём потоке
+        // уже после возврата из TProxyStartService, поэтому удаляем при отключении.
         if (!TProxyService.TProxyStartService(config.absolutePath, pfd.fd)) {
             error("не удалось запустить туннель")
         }
-        // Файл с паролем больше не нужен: библиотека уже прочитала его.
-        config.delete()
+        // Убеждаемся, что туннель прочитал настройки и работает.
+        Thread.sleep(400)
+        if (!TProxyService.TProxyIsRunning()) {
+            error("туннель остановился сразу после запуска")
+        }
         running = true
     }
 
@@ -159,6 +171,7 @@ class TunnelkaVpnService : VpnService() {
             }
         }
         running = false
+        File(cacheDir, "tunnel.yml").delete()
         try {
             tun?.close()
         } catch (_: Exception) {

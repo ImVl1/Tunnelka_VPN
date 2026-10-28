@@ -89,7 +89,7 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         val check = object : Runnable {
             override fun run() {
                 when {
-                    TunnelkaVpnService.running -> invoke.resolve(JSObject())
+                    TunnelkaVpnService.alive() -> invoke.resolve(JSObject())
                     TunnelkaVpnService.lastError != null ->
                         invoke.reject(TunnelkaVpnService.lastError)
                     System.currentTimeMillis() - started > 8000 ->
@@ -115,7 +115,7 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun state(invoke: Invoke) {
         val r = JSObject()
-        r.put("running", TunnelkaVpnService.running)
+        r.put("running", TunnelkaVpnService.alive())
         TunnelkaVpnService.lastError?.let { r.put("error", it) }
         invoke.resolve(r)
     }

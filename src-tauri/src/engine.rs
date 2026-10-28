@@ -134,6 +134,7 @@ pub const XRAY_EXE: &str = "xray";
 impl Paths {
     /// `core_dir` — явная папка с ядрами (Android: nativeLibraryDir).
     pub fn new(data: PathBuf, resource: Option<PathBuf>, core_dir: Option<PathBuf>) -> Self {
+        let android_core = core_dir.is_some();
         let core_dir = core_dir.unwrap_or_else(|| {
             // Где искать ядро: ресурсы установщика, рядом с exe, папка данных.
             let mut candidates = vec![];
@@ -153,13 +154,37 @@ impl Paths {
                 .cloned()
                 .unwrap_or_else(|| data.join("core"))
         });
+        // Android: sing-box следит за изменениями файлов правил, а папку нативных
+        // библиотек читать целиком нельзя — копируем базы в папку данных.
+        let ruleset_dir = if android_core {
+            let rules = data.join("rules");
+            let _ = std::fs::create_dir_all(&rules);
+            for f in [
+                singbox::RULESET_GEOSITE_RU_ANDROID,
+                singbox::RULESET_GEOIP_RU_ANDROID,
+            ] {
+                let src = core_dir.join(f);
+                let dst = rules.join(f);
+                let stale = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+                    (Ok(a), Ok(b)) => a.len() != b.len(),
+                    (Ok(_), Err(_)) => true,
+                    _ => false,
+                };
+                if stale {
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
+            rules
+        } else {
+            core_dir.clone()
+        };
         Paths {
             state: data.join("state.json"),
             config: data.join("config.json"),
             xray_config: data.join("xray.json"),
             singbox: core_dir.join(SINGBOX_EXE),
             xray: core_dir.join(XRAY_EXE),
-            ruleset_dir: core_dir,
+            ruleset_dir,
             data,
         }
     }
