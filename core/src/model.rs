@@ -121,8 +121,16 @@ pub enum CoreChoice {
 pub struct SplitTunnel {
     #[serde(default)]
     pub app_mode: AppMode,
-    /// Имена процессов (`chrome.exe`), полные пути (`C:\Games\x.exe`) или папки (`C:\Games\`).
+    /// Приложения для режима «через VPN только выбранные».
+    /// Windows: имена процессов (`chrome.exe`), полные пути или папки (`C:\Games\`).
+    /// Android: имена пакетов (`org.telegram.messenger`).
     #[serde(default)]
+    pub apps_include: Vec<String>,
+    /// Приложения для режима «всё через VPN, кроме выбранных».
+    #[serde(default)]
+    pub apps_exclude: Vec<String>,
+    /// Старый общий список (до версии 1.1). Переносится в список текущего режима.
+    #[serde(default, skip_serializing)]
     pub apps: Vec<String>,
     /// Домены/IP/подсети, которые всегда идут через VPN.
     #[serde(default)]
@@ -139,10 +147,44 @@ impl Default for SplitTunnel {
     fn default() -> Self {
         Self {
             app_mode: AppMode::Off,
+            apps_include: vec![],
+            apps_exclude: vec![],
             apps: vec![],
             proxy_domains: vec![],
             direct_domains: vec![],
             ru_direct: true,
+        }
+    }
+}
+
+impl SplitTunnel {
+    /// Переносит старый общий список в список текущего режима и чистит дубли.
+    pub fn normalize(&mut self) {
+        if !self.apps.is_empty() {
+            let old = std::mem::take(&mut self.apps);
+            let target = match self.app_mode {
+                AppMode::Include => &mut self.apps_include,
+                _ => &mut self.apps_exclude,
+            };
+            if target.is_empty() {
+                *target = old;
+            }
+        }
+        for list in [&mut self.apps_include, &mut self.apps_exclude] {
+            let mut seen = std::collections::HashSet::new();
+            list.retain(|a| {
+                let a = a.trim();
+                !a.is_empty() && seen.insert(a.to_lowercase())
+            });
+        }
+    }
+
+    /// Список приложений активного режима.
+    pub fn active_apps(&self) -> &[String] {
+        match self.app_mode {
+            AppMode::Off => &[],
+            AppMode::Include => &self.apps_include,
+            AppMode::Exclude => &self.apps_exclude,
         }
     }
 }
@@ -155,25 +197,12 @@ fn yes() -> bool {
 pub struct Settings {
     #[serde(default)]
     pub mode: Mode,
-    /// Локальный HTTP/SOCKS5-прокси (для системного прокси и других программ).
-    #[serde(default = "p_mixed")]
+    /// Порт локального прокси в режиме «Системный прокси». 0 — случайный при каждом
+    /// подключении (так сайтам и программам сложнее найти прокси сканированием портов).
+    #[serde(default)]
     pub mixed_port: u16,
-    /// Отдельный вход для расширения браузера: всё, что сюда пришло, идёт через VPN.
-    #[serde(default = "p_ext")]
-    pub ext_port: u16,
-    /// Локальный API для расширения.
-    #[serde(default = "p_api")]
-    pub api_port: u16,
-    /// Clash API ядра (статистика, переключение серверов на лету).
-    #[serde(default = "p_clash")]
-    pub clash_port: u16,
-    /// Первый порт для локальных SOCKS-входов Xray (по одному на сервер).
-    #[serde(default = "p_xray")]
-    pub xray_port: u16,
     #[serde(default)]
     pub core: CoreChoice,
-    #[serde(default)]
-    pub api_token: String,
     /// DNS через VPN: `https://1.1.1.1/dns-query`, `tls://8.8.8.8`, `8.8.8.8`.
     #[serde(default = "dns_remote")]
     pub dns_remote: String,
@@ -182,10 +211,25 @@ pub struct Settings {
     pub dns_direct: String,
     #[serde(default)]
     pub ipv6: bool,
+    /// Раздавать VPN устройствам в локальной сети (прокси с логином и паролем).
     #[serde(default)]
     pub allow_lan: bool,
+    #[serde(default = "p_lan")]
+    pub lan_port: u16,
+    #[serde(default)]
+    pub lan_password: String,
+    /// Запуск вместе с Windows.
+    #[serde(default)]
+    pub autostart: bool,
+    /// Подключаться при запуске приложения.
     #[serde(default)]
     pub auto_connect: bool,
+    /// Если в режиме TUN нет интернета — переключиться на системный прокси.
+    #[serde(default = "yes")]
+    pub tun_fallback: bool,
+    /// Блокировать интернет, если VPN неожиданно отключился.
+    #[serde(default)]
+    pub kill_switch: bool,
     #[serde(default = "user_agent")]
     pub user_agent: String,
     #[serde(default)]
@@ -194,20 +238,8 @@ pub struct Settings {
     pub log_level: String,
 }
 
-fn p_mixed() -> u16 {
+fn p_lan() -> u16 {
     2080
-}
-fn p_ext() -> u16 {
-    2081
-}
-fn p_api() -> u16 {
-    2082
-}
-fn p_clash() -> u16 {
-    2083
-}
-fn p_xray() -> u16 {
-    10800
 }
 fn dns_remote() -> String {
     "https://1.1.1.1/dns-query".into()
@@ -221,13 +253,36 @@ fn user_agent() -> String {
     "v2rayN/7.10.0".into()
 }
 fn log_level() -> String {
-    "info".into()
+    "warn".into()
 }
 
 impl Default for Settings {
     fn default() -> Self {
         serde_json::from_str("{}").expect("default settings")
     }
+}
+
+/// Параметры одного запуска ядра: случайные порты и пароли, которые
+/// не хранятся на диске и меняются при каждом подключении.
+#[derive(Debug, Clone, Default)]
+pub struct Runtime {
+    /// Локальный прокси (0 — не нужен).
+    pub mixed_port: u16,
+    /// Требовать логин/пароль на локальном прокси (Android).
+    pub mixed_auth: bool,
+    pub clash_port: u16,
+    pub secret: String,
+    pub socks_user: String,
+    pub socks_pass: String,
+    /// Порты SOCKS-входов Xray, по одному на сервер.
+    pub xray_ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Platform {
+    #[default]
+    Windows,
+    Android,
 }
 
 /// Что выбрано для подключения.

@@ -243,7 +243,20 @@ pub async fn fetch(
             apply_header(&mut f, k.as_str(), v);
         }
     }
-    let body = resp.text().await.map_err(|e| e.to_string())?;
+    // Ограничиваем размер ответа: подписка не бывает больше нескольких мегабайт.
+    const MAX: usize = 8 * 1024 * 1024;
+    if resp.content_length().unwrap_or(0) as usize > MAX {
+        return Err("ответ сервера подписки слишком большой".into());
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        buf.extend_from_slice(&chunk);
+        if buf.len() > MAX {
+            return Err("ответ сервера подписки слишком большой".into());
+        }
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
     parse_body_into(&mut f, &body, seed);
     if f.servers.is_empty() {
         return Err("в подписке не найдено ни одного сервера".into());

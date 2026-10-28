@@ -359,7 +359,15 @@ pub struct XrayEntry<'a> {
 
 /// Для каждого сервера — SOCKS-вход на 127.0.0.1:port, ведущий в его outbound.
 /// `dns` — IP DNS-сервера для разрешения адресов серверов (идёт мимо VPN).
-pub fn build_config(entries: &[XrayEntry], dns: &str, ipv6: bool, log_level: &str) -> Value {
+/// `auth` — логин и пароль на SOCKS-входах, чтобы другие программы не могли
+/// найти их сканированием портов и воспользоваться.
+pub fn build_config(
+    entries: &[XrayEntry],
+    dns: &str,
+    ipv6: bool,
+    log_level: &str,
+    auth: (&str, &str),
+) -> Value {
     let mut inbounds = vec![];
     let mut outbounds = vec![];
     let mut rules = vec![];
@@ -371,7 +379,12 @@ pub fn build_config(entries: &[XrayEntry], dns: &str, ipv6: bool, log_level: &st
             "listen": "127.0.0.1",
             "port": e.port,
             "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": true, "ip": "127.0.0.1"}
+            "settings": {
+                "auth": "password",
+                "accounts": [{"user": auth.0, "pass": auth.1}],
+                "udp": true,
+                "ip": "127.0.0.1"
+            }
         }));
         let mut ob = e.outbound.clone();
         ob["tag"] = json!(out_tag);
@@ -462,7 +475,8 @@ mod tests {
     #[test]
     fn config() {
         let ob = parse_link("vless://u@h.example.com:443?type=xhttp&security=tls&sni=h.example.com#x").unwrap().outbound;
-        let c = build_config(&[XrayEntry { tag: "s1", port: 10800, outbound: &ob }], "77.88.8.8", false, "info");
+        let c = build_config(&[XrayEntry { tag: "s1", port: 10800, outbound: &ob }], "77.88.8.8", false, "info", ("u", "p"));
+        assert_eq!(c["inbounds"][0]["settings"]["accounts"][0]["pass"], "p");
         assert_eq!(c["inbounds"][0]["port"], 10800);
         assert_eq!(c["routing"]["rules"][0]["outboundTag"], "out-s1");
         assert_eq!(c["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");

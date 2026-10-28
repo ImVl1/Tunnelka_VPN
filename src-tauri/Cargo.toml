@@ -5,11 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Tunnelka — клиент VLESS/VMess/Trojan/Shadowsocks/Hysteria2 с раздельным туннелированием"
 
+[lib]
+name = "tunnelka_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tunnelka-core = { path = "../core" }
+tauri-plugin-tunnelka-vpn = { path = "../plugins/vpn" }
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,8 +22,10 @@ tokio = { version = "1", features = ["time", "net", "sync", "macros"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 uuid = { version = "1", features = ["v4"] }
-tiny_http = "0.12"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

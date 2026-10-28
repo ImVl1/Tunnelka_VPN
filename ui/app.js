@@ -10,6 +10,8 @@ let pings = {};           // id сервера → мс (0 — нет ответ
 let activeSub = null;     // открытая вкладка подписки
 let lastTraffic = null;   // { up, down, t }
 let view = "home";
+let platform = "windows";  // windows | android
+const isAndroid = () => platform === "android";
 
 // ---------------------------------------------------------------------------
 // утилиты
@@ -58,6 +60,12 @@ async function reload() {
   render();
 }
 
+function openUrl(url) {
+  if (!/^(https?|tg):\/\//.test(url)) return;
+  if (isAndroid()) window.open(url, "_blank");
+  else call("open_url", { url });
+}
+
 function needsXray() {
   const sub = data?.subscriptions.find((s) => s.id === selectedSubId());
   return !!sub?.servers.some((x) => x.xray && !x.outbound);
@@ -103,20 +111,25 @@ function renderHome() {
   const sub = $("#state-sub");
   sub.classList.remove("error");
   if (!status?.core_found) {
-    sub.textContent = "Не найдено ядро sing-box. Переустановите приложение или положите sing-box.exe в папку core.";
+    sub.textContent = "Не найдено ядро sing-box. Переустановите приложение.";
     sub.classList.add("error");
   } else if (!status?.xray_found && needsXray()) {
-    sub.textContent = "Для XHTTP-серверов нужно ядро Xray: положите xray.exe в папку core рядом с sing-box.exe.";
+    sub.textContent = "Для XHTTP-серверов нужно ядро Xray. Переустановите приложение.";
     sub.classList.add("error");
   } else if (status?.last_error && !on) {
     sub.textContent = status.last_error;
     sub.classList.add("error");
   } else if (on) {
-    sub.textContent = status.mode === "tun" ? "Режим TUN" : `Системный прокси 127.0.0.1:${status.mixed_port}`;
+    sub.textContent = isAndroid() ? "Весь трафик телефона идёт через VPN"
+      : status.mode === "tun" ? "Режим TUN" : `Системный прокси 127.0.0.1:${status.mixed_port}`;
   } else {
     sub.textContent = "Нажмите на тоннель, чтобы подключиться";
   }
   $("#stats").hidden = !on;
+  const notice = $("#notice");
+  notice.hidden = !(on && status?.notice);
+  notice.textContent = status?.notice ?? "";
+  $("#unblock").hidden = on || !status?.kill_switch_active;
   $("#current-name").textContent = status?.selected_name ?? "Не выбран — добавьте подписку";
   const mode = data?.settings.mode ?? "tun";
   $$(".seg button").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
@@ -136,6 +149,11 @@ $("#power").onclick = async () => {
     renderHome();
     try { status = await call("connect"); } catch { status = await invoke("status"); }
   }
+  renderHome();
+};
+
+$("#unblock").onclick = async () => {
+  status = await call("disconnect", undefined, "Интернет разблокирован");
   renderHome();
 };
 
@@ -238,7 +256,7 @@ function renderServers() {
       ${sub.announce ? `<div class="announce">${esc(sub.announce)}</div>` : ""}
       ${sub.last_error ? `<div class="err">Последнее обновление не удалось: ${esc(sub.last_error)}</div>` : ""}
     </div>`;
-  $$("[data-open]").forEach((b) => (b.onclick = () => call("open_url", { url: b.dataset.open })));
+  $$("[data-open]").forEach((b) => (b.onclick = () => openUrl(b.dataset.open)));
   $("#ping-btn").onclick = () => runPing(sub.id);
   if ($("#upd-btn")) $("#upd-btn").onclick = async (e) => {
     e.target.disabled = true;
@@ -339,19 +357,55 @@ $("#update-all").onclick = async (e) => {
 
 let splitDraft = null;
 
+/** Список приложений выбранного режима: у каждого режима он свой. */
+function appList() {
+  return splitDraft.app_mode === "include" ? splitDraft.apps_include : splitDraft.apps_exclude;
+}
+
+const APP_TEXT = {
+  windows: {
+    exclude: "Эти программы работают без VPN, всё остальное — через VPN.",
+    include: "Через VPN работают только эти программы, остальные — напрямую.",
+    placeholder: "chrome.exe, C:\\Games\\game.exe или папка C:\\Games\\",
+    pick: "Выбрать из запущенных",
+    title: "Запущенные программы",
+    hint: "Имя программы совпадает с именем .exe. Папка с «\\» на конце захватывает все программы внутри.",
+  },
+  android: {
+    exclude: "Эти приложения работают без VPN — например, банки и госуслуги: их трафик идёт напрямую, мимо туннеля.",
+    include: "Через VPN работают только эти приложения, остальные — напрямую.",
+    placeholder: "Имя пакета, например org.telegram.messenger",
+    pick: "Выбрать приложения",
+    title: "Приложения",
+    hint: "Списки для режимов «кроме выбранных» и «только выбранные» хранятся отдельно.",
+  },
+};
+
+let appLabels = {};  // id → название (для Android)
+
 function renderSplit() {
   if (!splitDraft) splitDraft = structuredClone(data.settings.split);
+  const t = APP_TEXT[platform];
   $$("#app-mode input").forEach((i) => (i.checked = i.value === splitDraft.app_mode));
-  $("#apps").innerHTML = splitDraft.apps
-    .map((a, i) => `<span class="chip">${esc(a)}<button data-i="${i}" aria-label="Убрать">×</button></span>`)
-    .join("") || `<span class="muted">Приложения не выбраны</span>`;
-  $$("#apps button").forEach((b) => (b.onclick = () => { splitDraft.apps.splice(+b.dataset.i, 1); renderSplit(); }));
+  const off = splitDraft.app_mode === "off";
+  $("#apps-box").hidden = off;
+  if (!off) {
+    $("#apps-caption").textContent = t[splitDraft.app_mode];
+    const list = appList();
+    $("#apps").innerHTML = list
+      .map((a, i) => `<span class="chip" title="${esc(a)}">${esc(appLabels[a] ?? a)}<button data-i="${i}" aria-label="Убрать">×</button></span>`)
+      .join("") || `<span class="muted">Приложения не выбраны</span>`;
+    $$("#apps button").forEach((b) => (b.onclick = () => { appList().splice(+b.dataset.i, 1); renderSplit(); }));
+  }
+  $("#app-input").placeholder = t.placeholder;
+  $("#app-pick").textContent = t.pick;
+  $("#apps-hint").textContent = t.hint;
   if (document.activeElement !== $("#proxy-domains")) $("#proxy-domains").value = splitDraft.proxy_domains.join("\n");
   if (document.activeElement !== $("#direct-domains")) $("#direct-domains").value = splitDraft.direct_domains.join("\n");
   $("#ru-direct").checked = splitDraft.ru_direct;
 }
 
-$$("#app-mode input").forEach((i) => (i.onchange = () => (splitDraft.app_mode = i.value)));
+$$("#app-mode input").forEach((i) => (i.onchange = () => { splitDraft.app_mode = i.value; renderSplit(); }));
 $("#ru-direct").onchange = (e) => (splitDraft.ru_direct = e.target.checked);
 const lines = (s) => s.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
 $("#proxy-domains").oninput = (e) => (splitDraft.proxy_domains = lines(e.target.value));
@@ -359,7 +413,13 @@ $("#direct-domains").oninput = (e) => (splitDraft.direct_domains = lines(e.targe
 
 function addApp(name) {
   name = name.trim();
-  if (name && !splitDraft.apps.some((a) => a.toLowerCase() === name.toLowerCase())) splitDraft.apps.push(name);
+  const list = appList();
+  if (name && !list.some((a) => a.toLowerCase() === name.toLowerCase())) list.push(name);
+}
+function removeApp(name) {
+  const list = appList();
+  const i = list.findIndex((a) => a.toLowerCase() === name.toLowerCase());
+  if (i >= 0) list.splice(i, 1);
 }
 $("#app-add").onclick = () => { addApp($("#app-input").value); $("#app-input").value = ""; renderSplit(); };
 $("#app-input").onkeydown = (e) => { if (e.key === "Enter") $("#app-add").click(); };
@@ -367,19 +427,20 @@ $("#app-input").onkeydown = (e) => { if (e.key === "Enter") $("#app-add").click(
 let procs = [];
 function renderProcs() {
   const f = $("#proc-filter").value.toLowerCase();
-  const chosen = new Set(splitDraft.apps.map((a) => a.toLowerCase()));
+  const chosen = new Set(appList().map((a) => a.toLowerCase()));
   $("#proc-list").innerHTML = procs
-    .filter((p) => !f || p.name.toLowerCase().includes(f) || (p.path ?? "").toLowerCase().includes(f))
-    .map((p) => `<label><input type="checkbox" value="${esc(p.name)}" ${chosen.has(p.name.toLowerCase()) ? "checked" : ""} />${esc(p.name)}<small>${esc(p.path ?? "")}</small></label>`)
+    .filter((p) => !f || p.label.toLowerCase().includes(f) || (p.detail ?? "").toLowerCase().includes(f))
+    .map((p) => `<label><input type="checkbox" value="${esc(p.id)}" ${chosen.has(p.id.toLowerCase()) ? "checked" : ""} />${esc(p.label)}<small>${esc(p.detail ?? "")}</small></label>`)
     .join("") || `<div class="empty">Ничего не найдено</div>`;
   $$("#proc-list input").forEach((i) => (i.onchange = () => {
-    if (i.checked) addApp(i.value);
-    else splitDraft.apps = splitDraft.apps.filter((a) => a.toLowerCase() !== i.value.toLowerCase());
+    if (i.checked) addApp(i.value); else removeApp(i.value);
     renderSplit();
   }));
 }
 $("#app-pick").onclick = async () => {
-  procs = await call("list_processes");
+  $("#proc-title").textContent = APP_TEXT[platform].title;
+  procs = await call("list_apps");
+  for (const p of procs) appLabels[p.id] = p.label;
   $("#proc-filter").value = "";
   renderProcs();
   $("#proc-dialog").showModal();
@@ -387,7 +448,7 @@ $("#app-pick").onclick = async () => {
 $("#proc-filter").oninput = renderProcs;
 
 $("#split-save").onclick = async () => {
-  if (splitDraft.app_mode !== "off" && !splitDraft.apps.length) {
+  if (splitDraft.app_mode !== "off" && !appList().length) {
     return toast("Добавьте хотя бы одно приложение или выберите «Не разделять по приложениям»", true);
   }
   const settings = { ...data.settings, split: splitDraft };
@@ -402,18 +463,21 @@ $("#split-save").onclick = async () => {
 
 const FIELDS = [
   ["#s-dns-remote", "dns_remote"], ["#s-dns-direct", "dns_direct"], ["#s-ua", "user_agent"], ["#s-log", "log_level"],
-  ["#s-core", "core"], ["#s-xray-port", "xray_port", Number],
-  ["#s-mixed", "mixed_port", Number], ["#s-ext", "ext_port", Number], ["#s-api", "api_port", Number], ["#s-clash", "clash_port", Number],
+  ["#s-core", "core"], ["#s-mixed", "mixed_port", Number], ["#s-lan-port", "lan_port", Number],
 ];
-const CHECKS = [["#s-ipv6", "ipv6"], ["#s-lan", "allow_lan"], ["#s-auto", "auto_connect"]];
+const CHECKS = [
+  ["#s-ipv6", "ipv6"], ["#s-lan", "allow_lan"], ["#s-auto", "auto_connect"], ["#s-autostart", "autostart"],
+  ["#s-killswitch", "kill_switch"], ["#s-fallback", "tun_fallback"],
+];
 
 function renderSettings() {
   const s = data.settings;
   for (const [sel, key] of FIELDS) if (document.activeElement !== $(sel)) $(sel).value = s[key];
   for (const [sel, key] of CHECKS) $(sel).checked = s[key];
-  $("#pair-port").textContent = s.api_port;
-  $("#pair-token").textContent = s.api_token;
+  $("#lan-pass").textContent = s.lan_password;
+  $("#lan-info").hidden = !s.allow_lan;
 }
+$("#s-lan").onchange = (e) => ($("#lan-info").hidden = !e.target.checked);
 
 $("#settings-save").onclick = async () => {
   const s = { ...data.settings };
@@ -422,15 +486,7 @@ $("#settings-save").onclick = async () => {
   await call("save_settings", { settings: s }, "Настройки сохранены");
   await reload();
 };
-$("#copy-token").onclick = async () => {
-  try { await navigator.clipboard.writeText(data.settings.api_token); toast("Токен скопирован"); }
-  catch { toast("Выделите токен и нажмите Ctrl+C", true); }
-};
-$("#new-token").onclick = async () => {
-  if (!confirm("Старый токен перестанет работать в расширении. Продолжить?")) return;
-  await call("regenerate_token", undefined, "Создан новый токен");
-  await reload();
-};
+$("#open-vpn-settings").onclick = () => call("open_vpn_settings");
 
 // ---------------------------------------------------------------------------
 // журнал
@@ -459,6 +515,8 @@ function render() {
 (async () => {
   try {
     status = await invoke("status");
+    platform = status.platform;
+    document.body.classList.add(`p-${platform}`);
     await reload();
   } catch (e) {
     toast(String(e), true);

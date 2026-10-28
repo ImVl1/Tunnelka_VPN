@@ -4,7 +4,7 @@
 // Версии можно переопределить: SING_BOX_VERSION=1.14.4 XRAY_VERSION=26.10.21 npm run fetch-core
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, copyFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +47,7 @@ try {
     else execFileSync("unzip", ["-q", zip, "-d", ex]);
     const exe = findFile(ex, name);
     if (!exe) throw new Error(`в архиве нет ${name}`);
+    // copy, а не rename: временная папка может быть на другом диске (C: → D:).
     copyFileSync(exe, join(out, name));
   }
 

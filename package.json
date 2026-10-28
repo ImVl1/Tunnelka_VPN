@@ -1,14 +1,16 @@
 {
   "name": "tunnelka",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
+    "tauri": "tauri",
     "fetch-core": "node scripts/fetch-singbox.mjs",
+    "fetch-android": "node scripts/fetch-android.mjs",
     "dev": "tauri dev",
     "build": "tauri build",
-    "pack-extension": "node scripts/pack-extension.mjs",
-    "test": "cargo test -p tunnelka-core"
+    "build-android": "tauri android build --apk --target aarch64",
+    "test": "cargo test -p tunnelka-core -p tunnelka"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

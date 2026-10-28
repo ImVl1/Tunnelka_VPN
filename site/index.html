@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tunnelka — VPN-клиент для Windows и Android</title>
+  <meta name="description" content="Клиент для подписок VLESS, VMess, Trojan, Shadowsocks, Hysteria2 и TUIC с раздельным туннелированием. Windows и Android." />
+  <link rel="icon" href="icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Manrope:wght@400;500;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #13202a;
+      --deep: #0f1a22;
+      --panel: #1a2b37;
+      --line: #2c4556;
+      --text: #e6eef3;
+      --muted: #8ea4b3;
+      --teal: #19b3a6;
+      --blue: #2f7bea;
+      --mid: #2497c8;
+      color-scheme: dark;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body {
+      margin: 0; color: var(--text); background: var(--bg);
+      font: 400 17px/1.6 Manrope, "Segoe UI", system-ui, sans-serif;
+    }
+    a { color: inherit; }
+    :focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; border-radius: 4px; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+    /* ---------- первый экран ---------- */
+    .hero {
+      display: grid; grid-template-columns: 1.05fr .95fr; gap: 48px; align-items: end;
+      padding: 72px 0 64px;
+    }
+    .word {
+      font: 700 clamp(48px, 8vw, 92px)/.95 Unbounded, sans-serif; letter-spacing: -.02em; margin: 0;
+    }
+    .lead { font-size: 20px; color: var(--muted); max-width: 34ch; margin: 22px 0 36px; }
+    .lead b { color: var(--text); font-weight: 500; }
+
+    .arches { width: 100%; max-width: 460px; justify-self: end; display: block; overflow: visible; }
+    .arches path { fill: none; stroke-linecap: round; }
+    .arches .a1 { stroke: var(--blue); stroke-width: 15; }
+    .arches .a2 { stroke: var(--mid); stroke-width: 15; }
+    .arches .a3 { stroke: var(--teal); stroke-width: 15; }
+    .arches .g { stroke: var(--text); stroke-width: 7; }
+    @media (prefers-reduced-motion: no-preference) {
+      .arches path { stroke-dasharray: 520; stroke-dashoffset: 520; animation: draw 1.4s cubic-bezier(.6,.05,.25,1) forwards; }
+      .arches .g { animation-delay: 0s; animation-duration: .6s; }
+      .arches .a1 { animation-delay: .2s; }
+      .arches .a2 { animation-delay: .4s; }
+      .arches .a3 { animation-delay: .6s; }
+      @keyframes draw { to { stroke-dashoffset: 0; } }
+    }
+
+    /* ---------- загрузка ---------- */
+    .downloads { display: flex; flex-wrap: wrap; gap: 14px; }
+    .dl {
+      display: flex; align-items: center; gap: 14px; min-width: 250px;
+      padding: 14px 20px 14px 16px; border-radius: 14px; text-decoration: none;
+      background: var(--teal); color: #052421; border: 2px solid var(--teal);
+    }
+    .dl.alt { background: transparent; color: var(--text); border-color: var(--line); }
+    .dl:hover { filter: brightness(1.07); }
+    .dl.alt:hover { border-color: var(--muted); filter: none; }
+    .dl svg { width: 30px; height: 30px; flex: none; }
+    .dl b { display: block; font: 700 17px/1.2 Manrope, sans-serif; }
+    .dl small { display: block; font-size: 13px; opacity: .78; }
+    .dl[aria-disabled="true"] { opacity: .55; pointer-events: none; }
+    .release { margin: 14px 0 0; font-size: 14px; color: var(--muted); }
+
+    /* ---------- возможности ---------- */
+    .features {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 40px 48px;
+      padding: 56px 0; border-top: 1px solid var(--line);
+    }
+    .features h2 { font: 500 19px/1.3 Unbounded, sans-serif; margin: 0 0 10px; }
+    .features p { margin: 0; color: var(--muted); font-size: 16px; }
+    .features .wide { grid-column: span 3; }
+    .protocols { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+    .protocols span { padding: 5px 12px; border-radius: 999px; background: var(--panel); font-size: 14px; }
+
+    /* ---------- скриншоты ---------- */
+    .shots {
+      display: grid; grid-template-columns: 1fr 260px; gap: 32px; align-items: end;
+      padding: 56px 0 64px; border-top: 1px solid var(--line);
+    }
+    .shots img { width: 100%; display: block; border-radius: 12px; border: 1px solid var(--line); }
+    .shots .phone img { border-radius: 26px; border-width: 6px; border-color: var(--deep); }
+    .shots figcaption { margin-top: 10px; color: var(--muted); font-size: 14px; }
+
+    footer {
+      padding: 28px 0 40px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px;
+      display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between;
+    }
+
+    @media (max-width: 820px) {
+      .hero { grid-template-columns: 1fr; padding: 40px 0 48px; gap: 8px; }
+      .arches { order: -1; max-width: 220px; justify-self: start; margin-bottom: 24px; }
+      .features { grid-template-columns: 1fr; gap: 28px; }
+      .features .wide { grid-column: auto; }
+      .shots { grid-template-columns: 1fr; }
+      .shots .phone { max-width: 260px; }
+      .dl { flex: 1 1 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <div>
+        <h1 class="word">Tunnelka</h1>
+        <p class="lead">VPN-клиент для ваших подписок. <b>Вставьте ссылку из бота или личного кабинета</b> — и подключайтесь на компьютере и телефоне.</p>
+        <div class="downloads">
+          <a class="dl" id="dl-win" href="#" aria-disabled="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 5.1 10.4 4v7.1H3zm0 13.8V12.9h7.4V20zM11.3 3.9 21 2.5v8.6h-9.7zm0 16.2v-7.2H21v8.6z"/></svg>
+            <span><b>Скачать для Windows</b><small id="dl-win-meta">Ищу последнюю версию…</small></span>
+          </a>
+          <a class="dl alt" id="dl-android" href="#" aria-disabled="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.6 9.5 19.4 6.3a.4.4 0 0 0-.7-.4L16.9 9.1A11 11 0 0 0 12 8a11 11 0 0 0-4.9 1.1L5.3 5.9a.4.4 0 0 0-.7.4l1.8 3.2A10 10 0 0 0 1 17.5h22a10 10 0 0 0-5.4-8M7 14.8a1 1 0 1 1 0-2 1 1 0 0 1 0 2m10 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2"/></svg>
+            <span><b>Скачать для Android</b><small id="dl-android-meta">APK для arm64</small></span>
+          </a>
+        </div>
+        <p class="release" id="release"></p>
+      </div>
+      <svg class="arches" viewBox="0 0 240 172" aria-hidden="true">
+        <path class="g" d="M8 164h224" />
+        <path class="a1" d="M20 160V120a100 100 0 0 1 200 0v40" />
+        <path class="a2" d="M55 160v-38a65 65 0 0 1 130 0v38" />
+        <path class="a3" d="M90 160v-36a30 30 0 0 1 60 0v36" />
+      </svg>
+    </section>
+
+    <section class="features" aria-label="Возможности">
+      <div>
+        <h2>Подписки как есть</h2>
+        <p>Работает с Marzban, Remnawave, 3x-ui и другими панелями. Показывает остаток трафика и срок, обновляет список серверов сам.</p>
+      </div>
+      <div>
+        <h2>Раздельный туннель</h2>
+        <p>Выберите, какие программы и сайты идут через VPN, а какие напрямую. Российские сайты можно сразу пустить мимо туннеля.</p>
+      </div>
+      <div>
+        <h2>Без утечек</h2>
+        <p>Kill switch блокирует интернет, если VPN отвалился. DNS и IPv6 не уходят мимо туннеля, локальные порты закрыты паролем.</p>
+      </div>
+      <div>
+        <h2>Сам находит рабочий путь</h2>
+        <p>Если сервер не отвечает, переключится на живой. Если провайдер ломает режим TUN, перейдёт на системный прокси.</p>
+      </div>
+      <div>
+        <h2>Автовыбор сервера</h2>
+        <p>Выбирает сервер с наименьшей задержкой и меняет его без разрыва соединения.</p>
+      </div>
+      <div>
+        <h2>Тихо в трее</h2>
+        <p>Запуск вместе с Windows и подключение при старте — по желанию, по умолчанию выключены.</p>
+      </div>
+      <div class="wide">
+        <h2>Протоколы</h2>
+        <div class="protocols">
+          <span>VLESS + REALITY</span><span>XHTTP</span><span>XTLS Vision</span><span>VMess</span><span>Trojan</span>
+          <span>Shadowsocks 2022</span><span>Hysteria2</span><span>TUIC</span><span>SOCKS5 / HTTP</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="shots" aria-label="Скриншоты">
+      <figure style="margin:0">
+        <img src="screenshots/windows-servers.png" alt="Список серверов подписки в Tunnelka для Windows" loading="lazy" />
+        <figcaption>Windows</figcaption>
+      </figure>
+      <figure class="phone" style="margin:0">
+        <img src="screenshots/android-home.png" alt="Главный экран Tunnelka на Android" loading="lazy" />
+        <figcaption>Android</figcaption>
+      </figure>
+    </section>
+
+    <footer>
+      <span>Tunnelka работает на ядрах sing-box и Xray-core.</span>
+      <span style="display:flex;gap:20px"><a id="repo-link" href="#">Исходный код</a><a id="all-releases" href="#">Все версии</a></span>
+    </footer>
+  </main>
+
+  <script>
+    // Репозиторий определяется по адресу сайта: <owner>.github.io/<repo>/
+    const owner = location.hostname.endsWith(".github.io") ? location.hostname.split(".")[0] : "ImVl1";
+    const repo = location.hostname.endsWith(".github.io") && location.pathname.split("/")[1]
+      ? location.pathname.split("/")[1] : "Tunnelka_VPN";
+    const repoUrl = `https://github.com/${owner}/${repo}`;
+    document.getElementById("repo-link").href = repoUrl;
+    document.getElementById("all-releases").href = `${repoUrl}/releases`;
+
+    const mb = (n) => `${(n / 1048576).toFixed(0)} МБ`;
+    function setButton(id, asset, fallback) {
+      const a = document.getElementById(id);
+      const meta = document.getElementById(`${id}-meta`);
+      a.href = asset ? asset.browser_download_url : fallback;
+      a.removeAttribute("aria-disabled");
+      if (asset) meta.textContent = `${asset.name.endsWith(".apk") ? "APK, " : ""}${mb(asset.size)}`;
+      else meta.textContent = "Открыть страницу загрузок";
+    }
+
+    fetch(`https://api.github.com/repos/${owner}/${repo}/releases/latest`, { headers: { Accept: "application/vnd.github+json" } })
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+      .then((rel) => {
+        const assets = rel.assets || [];
+        const exe = assets.find((x) => /setup\.exe$/i.test(x.name)) || assets.find((x) => /\.exe$/i.test(x.name));
+        const apk = assets.find((x) => /\.apk$/i.test(x.name));
+        setButton("dl-win", exe, rel.html_url);
+        setButton("dl-android", apk, rel.html_url);
+        const date = new Date(rel.published_at).toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+        document.getElementById("release").textContent = `Версия ${rel.tag_name.replace(/^v/, "")} от ${date}`;
+      })
+      .catch(() => {
+        const page = `${repoUrl}/releases/latest`;
+        setButton("dl-win", null, page);
+        setButton("dl-android", null, page);
+      });
+  </script>
+</body>
+</html>

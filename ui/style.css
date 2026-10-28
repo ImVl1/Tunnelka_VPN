@@ -193,3 +193,50 @@ dialog::backdrop { background: rgba(5, 12, 17, .6); }
   main { padding: 22px; }
   .form, .block.two { grid-template-columns: 1fr; }
 }
+
+/* ---------- платформы ---------- */
+nav .short { display: none; }
+.android-only { display: none; }
+body.p-android .desktop-only { display: none !important; }
+body.p-android .android-only { display: block; }
+.block.first { margin-top: 0; padding-top: 0; border-top: 0; }
+.block > .check + .check, .block > div > .check { margin-top: 10px; }
+.block .hint { margin: 6px 0 10px 26px; }
+.android-only .hint { margin-left: 0; }
+
+.notice {
+  margin: 14px 0 0; max-width: 60ch; padding: 10px 14px; border-radius: var(--radius-s);
+  background: #2a2418; color: var(--warn); font-size: 13px;
+}
+.ghost.danger { margin-top: 14px; border-color: var(--bad); color: var(--bad); }
+
+/* ---------- телефон: нижняя панель вместо боковой ---------- */
+@media (max-width: 700px) {
+  body { flex-direction: column; height: 100dvh; }
+  .side {
+    order: 2; width: 100%; flex-direction: row; padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
+    border-right: 0; border-top: 1px solid var(--line);
+  }
+  .brand, .side-foot { display: none; }
+  nav { flex-direction: row; flex: 1; gap: 0; }
+  nav button {
+    flex: 1; text-align: center; padding: 10px 2px; font-size: 12px; border-radius: 8px;
+  }
+  nav button.active { box-shadow: inset 0 -3px 0 var(--teal); }
+  nav .full { display: none; }
+  nav .short { display: inline; }
+  main { order: 1; padding: calc(16px + env(safe-area-inset-top)) 16px 24px; }
+  .view-head { flex-wrap: wrap; }
+  .arch { width: min(260px, 70vw); }
+  .home h1 { font-size: 26px; }
+  .stats { gap: 22px; }
+  .sub-card { grid-template-columns: 1fr; }
+  .sub-actions { grid-row: auto; grid-column: 1; flex-wrap: wrap; }
+  .srv { grid-template-columns: 14px 1fr auto auto; gap: 8px; padding: 10px; }
+  .srv .proto { display: none; }
+  .form, .block.two { grid-template-columns: 1fr; }
+  .seg { width: 100%; }
+  .seg button { flex: 1; padding: 7px 6px; }
+  #log-box { height: calc(100dvh - 190px); }
+  .row input { min-width: 0; flex-basis: 100%; }
+}

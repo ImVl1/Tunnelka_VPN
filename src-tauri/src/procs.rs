@@ -1,19 +1,22 @@
-//! Список запущенных программ (для выбора в раздельном туннелировании)
-//! и очистка «зависших» процессов ядра.
+//! Список программ для раздельного туннелирования и очистка «зависших» ядер.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
 use sysinfo::{ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ProcInfo {
-    pub name: String,
-    pub path: Option<String>,
+pub struct AppEntry {
+    /// Что сохраняется в настройках: имя .exe (Windows) или пакет (Android).
+    pub id: String,
+    /// Что показывается пользователю.
+    pub label: String,
+    /// Подробности: путь к программе или имя пакета.
+    pub detail: Option<String>,
 }
 
 /// Системные процессы, которые бессмысленно показывать в списке.
+#[cfg(not(target_os = "android"))]
 const HIDDEN: &[&str] = &[
     "system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
     "lsass.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe", "winlogon.exe",
@@ -21,13 +24,26 @@ const HIDDEN: &[&str] = &[
     "taskhostw.exe", "searchhost.exe", "startmenuexperiencehost.exe",
     "textinputhost.exe", "shellexperiencehost.exe", "memory compression",
     "secure system", "system idle process", "wudfhost.exe", "spoolsv.exe",
-    "audiodg.exe", "sing-box.exe", "tunnelka.exe", "msedgewebview2.exe",
+    "audiodg.exe", "sing-box.exe", "xray.exe", "tunnelka.exe", "msedgewebview2.exe",
 ];
 
-pub fn list() -> Vec<ProcInfo> {
+#[cfg(target_os = "android")]
+pub fn list() -> Result<Vec<AppEntry>, String> {
+    Ok(tauri_plugin_tunnelka_vpn::apps()?
+        .into_iter()
+        .map(|a| AppEntry {
+            id: a.package.clone(),
+            label: a.label,
+            detail: Some(a.package),
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn list() -> Result<Vec<AppEntry>, String> {
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
-    let mut map: BTreeMap<String, ProcInfo> = BTreeMap::new();
+    let mut map: std::collections::BTreeMap<String, AppEntry> = Default::default();
     for p in sys.processes().values() {
         let name = p.name().to_string_lossy().to_string();
         if name.is_empty() || HIDDEN.contains(&name.to_lowercase().as_str()) {
@@ -42,21 +58,25 @@ pub fn list() -> Vec<ProcInfo> {
                 }
             }
         }
-        map.entry(name.to_lowercase()).or_insert(ProcInfo { name, path });
+        map.entry(name.to_lowercase()).or_insert(AppEntry {
+            id: name.clone(),
+            label: name,
+            detail: path,
+        });
     }
-    map.into_values().collect()
+    Ok(map.into_values().collect())
 }
 
-/// Завершает sing-box, оставшийся от прошлого запуска (например, после сбоя).
-pub fn kill_orphans(singbox: &Path) {
-    let Ok(target) = singbox.canonicalize() else {
+/// Завершает ядро, оставшееся от прошлого запуска (например, после сбоя).
+pub fn kill_orphans(exe: &Path) {
+    let Ok(target) = exe.canonicalize() else {
         return;
     };
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
     for p in sys.processes().values() {
-        if let Some(exe) = p.exe().and_then(|e| e.canonicalize().ok()) {
-            if exe == target {
+        if let Some(path) = p.exe().and_then(|e| e.canonicalize().ok()) {
+            if path == target {
                 p.kill();
             }
         }

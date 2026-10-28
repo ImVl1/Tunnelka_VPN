@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Tunnelka</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -13,11 +13,11 @@
       <span>Tunnelka</span>
     </div>
     <nav>
-      <button data-view="home" class="active">Подключение</button>
-      <button data-view="servers">Серверы и подписки</button>
-      <button data-view="split">Раздельное туннелирование</button>
-      <button data-view="settings">Настройки</button>
-      <button data-view="logs">Журнал</button>
+      <button data-view="home" class="active"><span class="full">Подключение</span><span class="short">VPN</span></button>
+      <button data-view="servers"><span class="full">Серверы и подписки</span><span class="short">Серверы</span></button>
+      <button data-view="split"><span class="full">Раздельное туннелирование</span><span class="short">Правила</span></button>
+      <button data-view="settings"><span class="full">Настройки</span><span class="short">Настройки</span></button>
+      <button data-view="logs"><span class="full">Журнал</span><span class="short">Журнал</span></button>
     </nav>
     <div class="side-foot" id="side-status">Не подключено</div>
   </aside>
@@ -36,6 +36,8 @@
         </button>
         <h1 id="state-title">Не подключено</h1>
         <p id="state-sub" class="muted">Нажмите на тоннель, чтобы подключиться</p>
+        <p id="notice" class="notice" hidden></p>
+        <button class="ghost danger" id="unblock" hidden>Разблокировать интернет</button>
 
         <div class="stats" id="stats" hidden>
           <div><span class="muted">Время</span><b id="uptime">00:00:00</b></div>
@@ -48,11 +50,11 @@
           <b id="current-name">Не выбран</b>
         </button>
 
-        <div class="seg" role="radiogroup" aria-label="Режим">
+        <div class="seg desktop-only" role="radiogroup" aria-label="Режим">
           <button data-mode="tun">TUN — весь трафик</button>
           <button data-mode="proxy">Системный прокси</button>
         </div>
-        <p class="hint" id="mode-hint"></p>
+        <p class="hint desktop-only" id="mode-hint"></p>
       </div>
     </section>
 
@@ -88,13 +90,16 @@
           <label><input type="radio" name="app_mode" value="exclude" /> Все через VPN, кроме выбранных</label>
           <label><input type="radio" name="app_mode" value="include" /> Через VPN только выбранные</label>
         </div>
-        <div class="chips" id="apps"></div>
-        <div class="row">
-          <input id="app-input" placeholder="chrome.exe, C:\Games\game.exe или папка C:\Games\" />
-          <button class="ghost" id="app-add">Добавить</button>
-          <button class="ghost" id="app-pick">Выбрать из запущенных</button>
+        <div id="apps-box">
+          <p class="hint" id="apps-caption"></p>
+          <div class="chips" id="apps"></div>
+          <div class="row">
+            <input id="app-input" />
+            <button class="ghost" id="app-add">Добавить</button>
+            <button class="ghost" id="app-pick"></button>
+          </div>
+          <p class="hint" id="apps-hint"></p>
         </div>
-        <p class="hint">Имя программы совпадает с именем .exe. Папка с «\» на конце захватывает все программы внутри.</p>
       </div>
 
       <div class="block two">
@@ -121,41 +126,50 @@
         <h2>Настройки</h2>
         <button class="primary" id="settings-save">Сохранить</button>
       </header>
-      <div class="form">
-        <label>DNS через VPN<input id="s-dns-remote" /></label>
-        <label>DNS напрямую<input id="s-dns-direct" /></label>
-        <label>Локальный прокси (HTTP/SOCKS5)<input id="s-mixed" type="number" /></label>
-        <label>Порт для расширения браузера<input id="s-ext" type="number" /></label>
-        <label>Порт API расширения<input id="s-api" type="number" /></label>
-        <label>Порт Clash API ядра<input id="s-clash" type="number" /></label>
+      <div class="block first">
+        <h3>Запуск</h3>
+        <label class="check desktop-only"><input type="checkbox" id="s-autostart" /> Запускать вместе с Windows</label>
+        <label class="check"><input type="checkbox" id="s-auto" /> Подключаться при запуске приложения</label>
+      </div>
+
+      <div class="block">
+        <h3>Защита</h3>
+        <div class="desktop-only">
+          <label class="check"><input type="checkbox" id="s-killswitch" /> Kill switch — блокировать интернет, если VPN неожиданно отключился</label>
+          <p class="hint">Пока VPN включён, брандмауэр Windows пропускает в интернет только трафик через VPN. Если ядро упадёт, программы не смогут выйти в сеть напрямую. Кнопка «Отключить» снимает блокировку.</p>
+          <label class="check"><input type="checkbox" id="s-fallback" /> Если в режиме TUN нет интернета — переключаться на системный прокси</label>
+        </div>
+        <div class="android-only">
+          <p class="hint">На Android kill switch включается в системе: «Постоянная VPN» и «Блокировать соединения без VPN» для Tunnelka.</p>
+          <button class="ghost" id="open-vpn-settings">Открыть настройки VPN</button>
+        </div>
+        <label class="check"><input type="checkbox" id="s-ipv6" /> Использовать IPv6 (если выключено — IPv6 блокируется, чтобы не было утечек)</label>
+      </div>
+
+      <div class="form block">
         <label>Ядро для VLESS / VMess / Trojan
           <select id="s-core">
             <option value="auto">Авто: sing-box, Xray для XHTTP</option>
             <option value="xray">Всегда Xray-core</option>
           </select>
         </label>
-        <label>Первый порт Xray (по одному на сервер)<input id="s-xray-port" type="number" /></label>
+        <label>DNS через VPN<input id="s-dns-remote" /></label>
+        <label>DNS напрямую<input id="s-dns-direct" /></label>
+        <label class="desktop-only">Порт системного прокси (0 — случайный)<input id="s-mixed" type="number" min="0" max="65535" /></label>
         <label>User-Agent для подписок<input id="s-ua" /></label>
         <label>Подробность журнала
           <select id="s-log"><option>error</option><option>warn</option><option>info</option><option>debug</option></select>
         </label>
-        <label class="check"><input type="checkbox" id="s-ipv6" /> Использовать IPv6</label>
-        <label class="check"><input type="checkbox" id="s-lan" /> Разрешить подключения из локальной сети</label>
-        <label class="check"><input type="checkbox" id="s-auto" /> Подключаться при запуске</label>
       </div>
 
       <div class="block">
-        <h3>Расширение для Chrome</h3>
-        <p class="muted">Вставьте эти данные в настройки расширения, режим «Через приложение».</p>
-        <div class="pair">
-          <div><span class="muted">Порт API</span><b id="pair-port"></b></div>
-          <div><span class="muted">Токен</span><code id="pair-token"></code></div>
+        <h3>Раздача в локальную сеть</h3>
+        <label class="check"><input type="checkbox" id="s-lan" /> Разрешить другим устройствам подключаться через этот VPN</label>
+        <div class="pair" id="lan-info">
+          <div><span class="muted">Порт (HTTP и SOCKS5)</span><input id="s-lan-port" type="number" min="1024" max="65535" /></div>
+          <div><span class="muted">Логин</span><code>tunnelka</code></div>
+          <div><span class="muted">Пароль</span><code id="lan-pass"></code></div>
         </div>
-        <div class="row">
-          <button class="ghost" id="copy-token">Скопировать токен</button>
-          <button class="ghost" id="new-token">Создать новый токен</button>
-        </div>
-        <p class="hint">Изменение порта API вступит в силу после перезапуска приложения.</p>
       </div>
     </section>
 
@@ -171,7 +185,7 @@
 
   <dialog id="proc-dialog">
     <form method="dialog">
-      <h3>Запущенные программы</h3>
+      <h3 id="proc-title">Запущенные программы</h3>
       <input id="proc-filter" placeholder="Поиск" />
       <div id="proc-list" class="proc-list"></div>
       <div class="row end"><button class="ghost" value="close">Готово</button></div>
