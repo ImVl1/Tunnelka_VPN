@@ -57,7 +57,14 @@ pub struct Persisted {
     /// id сервера или `auto:<id подписки>`.
     #[serde(default)]
     pub selected: Option<String>,
+    /// Версия разбора подписок. Если приложение стало разбирать их иначе,
+    /// подписки перезагружаются при запуске.
+    #[serde(default)]
+    pub format: u32,
 }
+
+/// 2 — конфиги Xray подписок сохраняются целиком (цепочки и балансировщики).
+const FORMAT: u32 = 2;
 
 #[derive(Default)]
 struct Rt {
@@ -262,6 +269,12 @@ impl Engine {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         st.settings.split.normalize();
+        if st.format < FORMAT {
+            for sub in st.subscriptions.iter_mut().filter(|s| s.url.is_some()) {
+                sub.updated_at = 0;
+            }
+            st.format = FORMAT;
+        }
         if st.settings.lan_password.is_empty() {
             st.settings.lan_password = random_token()[..12].to_string();
         }
@@ -1202,49 +1215,14 @@ impl Engine {
             done(&self);
             return;
         }
-        self.log("[app] через TUN нет интернета, проверяю серверы");
-        let sub_id = self.rt.lock().unwrap().active_sub.clone().unwrap_or_default();
-        let tun_broken = if self.server_delay(TAG_PROXY).await.is_some() {
-            // Сервер отвечает, а программы в интернет выйти не могут — TUN не работает.
-            true
-        } else {
-            // Текущий сервер не отвечает: ищем рабочий.
-            let pings = self.ping(&sub_id).await;
-            let best = pings
-                .into_iter()
-                .filter(|(_, ms)| *ms > 0)
-                .min_by_key(|(_, ms)| *ms)
-                .map(|(id, _)| id);
-            match best {
-                None => {
-                    if same(&self) {
-                        self.rt.lock().unwrap().notice =
-                            Some("Ни один сервер подписки сейчас не отвечает".into());
-                    }
-                    done(&self);
-                    return;
-                }
-                Some(best) => {
-                    if !same(&self) || self.clash_select(&best).await.is_err() {
-                        done(&self);
-                        return;
-                    }
-                    if self.internet_works().await {
-                        let name = {
-                            let st = self.state.lock().unwrap();
-                            find_selection(&st.subscriptions, &best)
-                                .and_then(|(_, s)| s.map(|s| s.name.clone()))
-                                .unwrap_or_default()
-                        };
-                        self.rt.lock().unwrap().notice =
-                            Some(format!("Выбранный сервер не отвечал — подключено через «{name}»"));
-                        done(&self);
-                        return;
-                    }
-                    true
-                }
-            }
-        };
+        self.log("[app] через TUN нет интернета, проверяю сервер");
+        // Выбранный вручную сервер не меняем: если он не отвечает, сообщаем об этом.
+        let tun_broken = self.server_delay(TAG_PROXY).await.is_some();
+        if !tun_broken && same(&self) {
+            self.rt.lock().unwrap().notice =
+                Some("Сервер не отвечает — выберите другой или включите автовыбор".into());
+            self.log("[app] сервер не отвечает");
+        }
         if !tun_broken || !same(&self) {
             done(&self);
             return;

@@ -145,15 +145,20 @@ fn servers_from_xray_json(v: &Value, seed: &str) -> Vec<Server> {
         if !seen.insert(key.clone()) {
             continue;
         }
-        let (address, port) = crate::xray::outbound_endpoint(&ob);
+        let main = crate::xray::primary(&ob);
+        let (address, port) = crate::xray::outbound_endpoint(main);
+        let mut transport = crate::xray::outbound_label(main);
+        if crate::xray::is_bundle(&ob) {
+            transport += if ob.get("balancer").is_some() { " · балансировка" } else { " · цепочка" };
+        }
         out.push(Server {
             id: server_id(&format!("{seed}|xray|{key}")),
             name,
             link: String::new(),
-            protocol: ob["protocol"].as_str().unwrap_or("xray").to_string(),
+            protocol: main["protocol"].as_str().unwrap_or("xray").to_string(),
             address,
             port,
-            transport: crate::xray::outbound_label(&ob),
+            transport,
             outbound: None,
             xray: Some(ob),
             error: None,

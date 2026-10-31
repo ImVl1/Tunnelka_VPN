@@ -291,10 +291,9 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
                 .xray_ports
                 .get(xray_entries.len())
                 .ok_or("не хватило портов для Xray")?;
-            xray_entries.push((s.id.clone(), port, s.xray.clone().unwrap()));
-            if !s.address.is_empty() && s.address.parse::<std::net::IpAddr>().is_err() {
-                xray_hosts.push(s.address.to_lowercase());
-            }
+            let xv = s.xray.clone().unwrap();
+            xray_hosts.extend(xray::hosts(&xv));
+            xray_entries.push((s.id.clone(), port, xv));
             json!({
                 "type": "socks",
                 "tag": s.id,

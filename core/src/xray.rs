@@ -7,6 +7,8 @@
 //!
 //! Формат конфига сверён с Xray-core v26.10 (infra/conf).
 
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
 use crate::links::{b64_decode_str, csv, decode, is_ip, split_uri, transport_label, Result, Uri};
@@ -278,27 +280,219 @@ fn vmess(rest: &str) -> Result<XParsed> {
 
 const XRAY_PROTOCOLS: &[&str] = &["vless", "vmess", "trojan", "shadowsocks", "hysteria"];
 
-/// Из одного конфига Xray достаёт основной outbound (tag "proxy" или первый прокси).
+/// Из одного конфига Xray подписки достаёт то, через что идёт трафик: основной
+/// outbound (как выбрал бы сам Xray по правилам маршрутизации) или балансировщик.
+///
+/// Если основной outbound ни от чего не зависит, возвращается он сам. Если он
+/// подключается через другие outbound'ы (`dialerProxy`, `proxySettings` —
+/// цепочки, «белые списки», фрагментация) или это балансировщик, возвращается
+/// «связка»: `{"bundle": true, "main": ..., "outbounds": [...], "balancer": ...}`.
+/// Её целиком запускает Xray, как в исходном конфиге.
 pub fn outbound_from_config(cfg: &Value) -> Option<(String, Value)> {
-    let obs = cfg.get("outbounds")?.as_array()?;
-    let is_proxy = |o: &&Value| {
+    let obs: Vec<&Value> = cfg.get("outbounds")?.as_array()?.iter().collect();
+    let tag_of = |o: &Value| o.get("tag").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let by_tag = |t: &str| obs.iter().copied().find(|o| !t.is_empty() && tag_of(o) == t);
+    let is_proxy = |o: &Value| {
         o.get("protocol")
             .and_then(|p| p.as_str())
             .map(|p| XRAY_PROTOCOLS.contains(&p))
             .unwrap_or(false)
     };
-    let ob = obs
-        .iter()
-        .filter(is_proxy)
-        .find(|o| o.get("tag").and_then(|t| t.as_str()) == Some("proxy"))
-        .or_else(|| obs.iter().find(is_proxy))?;
+
+    // Куда Xray отправил бы обычный трафик: первое правило без условий или,
+    // если такого нет, первый outbound списка.
+    let rules = cfg
+        .pointer("/routing/rules")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let catch_all = rules.iter().find(|r| is_catch_all(r));
+    let balancers = cfg
+        .pointer("/routing/balancers")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut main: Option<&Value> = None;
+    let mut balancer: Option<Value> = None;
+    match catch_all {
+        Some(r) if r.get("balancerTag").is_some() => {
+            let bt = r["balancerTag"].as_str().unwrap_or("");
+            balancer = balancers.iter().find(|b| b["tag"].as_str() == Some(bt)).cloned();
+        }
+        Some(r) => main = r["outboundTag"].as_str().and_then(by_tag).filter(|o| is_proxy(o)),
+        None => main = obs.first().copied().filter(|o| is_proxy(o)),
+    }
+    // Балансировщик без подходящих серверов не нужен.
+    let members: Vec<&Value> = match &balancer {
+        Some(b) => {
+            let sel: Vec<&str> = b["selector"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            obs.iter()
+                .copied()
+                .filter(|o| is_proxy(o) && sel.iter().any(|p| tag_of(o).starts_with(p)))
+                .collect()
+        }
+        None => vec![],
+    };
+    if members.is_empty() {
+        balancer = None;
+    }
+    if main.is_none() && balancer.is_none() {
+        // Нестандартная маршрутизация: берём «proxy» или первый прокси,
+        // который сам не служит промежуточным звеном цепочки.
+        let deps: HashSet<String> = obs.iter().flat_map(|o| dep_tags(o)).collect();
+        main = obs
+            .iter()
+            .copied()
+            .filter(|o| is_proxy(o))
+            .find(|o| tag_of(o) == "proxy")
+            .or_else(|| obs.iter().copied().filter(|o| is_proxy(o)).find(|o| !deps.contains(&tag_of(o))))
+            .or_else(|| obs.iter().copied().find(|o| is_proxy(o)));
+    }
+    let primary = main.or_else(|| members.first().copied())?;
     let name = cfg
         .get("remarks")
         .and_then(|r| r.as_str())
-        .or_else(|| ob.get("tag").and_then(|t| t.as_str()))
-        .unwrap_or("Xray")
-        .to_string();
-    Some((name, clean_outbound(ob)))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            let t = tag_of(primary);
+            if t.is_empty() { "Xray".into() } else { t }
+        });
+
+    // Всё, от чего зависит основной outbound (или участники балансировщика).
+    let mut need: Vec<String> = vec![];
+    let mut queue: Vec<&Value> = match &balancer {
+        Some(_) => members.clone(),
+        None => vec![primary],
+    };
+    if let Some(fb) = balancer.as_ref().and_then(|b| b["fallbackTag"].as_str()).and_then(by_tag) {
+        queue.push(fb);
+    }
+    while let Some(o) = queue.pop() {
+        let t = tag_of(o);
+        if need.contains(&t) {
+            continue;
+        }
+        need.push(t);
+        for d in dep_tags(o) {
+            if let Some(dep) = by_tag(&d) {
+                queue.push(dep);
+            }
+        }
+    }
+    let has_deps = need.len() > 1 || balancer.is_some();
+    if !has_deps {
+        return Some((name, clean_outbound(primary)));
+    }
+    // Связка: outbound'ы в исходном порядке, без тех, что не нужны.
+    let mut list: Vec<Value> = vec![];
+    for (i, o) in obs.iter().enumerate() {
+        let t = tag_of(o);
+        if !need.contains(&t) {
+            continue;
+        }
+        let mut o = (*o).clone();
+        if t.is_empty() {
+            o["tag"] = json!(format!("ob{i}"));
+        }
+        if let Some(m) = o.as_object_mut() {
+            m.remove("sendThrough");
+        }
+        list.push(o);
+    }
+    let tags: HashSet<String> = list.iter().map(|o| tag_of(o)).collect();
+    // Ссылки на outbound'ы, которых нет в конфиге, убираем.
+    for o in list.iter_mut() {
+        if let Some(sock) = o.pointer_mut("/streamSettings/sockopt").and_then(|s| s.as_object_mut()) {
+            if sock.get("dialerProxy").and_then(|d| d.as_str()).map(|d| !tags.contains(d)).unwrap_or(false) {
+                sock.remove("dialerProxy");
+            }
+        }
+        if o.pointer("/proxySettings/tag").and_then(|d| d.as_str()).map(|d| !tags.contains(d)).unwrap_or(false) {
+            o.as_object_mut().unwrap().remove("proxySettings");
+        }
+    }
+    let mut bundle = json!({
+        "bundle": true,
+        "main": main.map(|o| tag_of(o)),
+        "outbounds": list,
+    });
+    if let Some(b) = balancer {
+        bundle["balancer"] = b;
+        for key in ["observatory", "burstObservatory"] {
+            if let Some(v) = cfg.get(key) {
+                bundle[key] = v.clone();
+            }
+        }
+    }
+    Some((name, bundle))
+}
+
+/// Правило маршрутизации без условий (ловит весь трафик).
+fn is_catch_all(r: &Value) -> bool {
+    let Some(m) = r.as_object() else { return false };
+    if m.get("outboundTag").is_none() && m.get("balancerTag").is_none() {
+        return false;
+    }
+    m.iter().all(|(k, v)| match k.as_str() {
+        "type" | "outboundTag" | "balancerTag" | "ruleTag" | "inboundTag" => true,
+        "network" => {
+            let n = v.as_str().unwrap_or("").replace(' ', "");
+            n.contains("tcp") && n.contains("udp")
+        }
+        "port" => matches!(v.as_str().map(|s| s.trim()), Some("0-65535") | Some("1-65535")),
+        _ => false,
+    })
+}
+
+/// Теги outbound'ов, через которые подключается данный.
+fn dep_tags(o: &Value) -> Vec<String> {
+    let mut v = vec![];
+    if let Some(t) = o.pointer("/streamSettings/sockopt/dialerProxy").and_then(|t| t.as_str()) {
+        v.push(t.to_string());
+    }
+    if let Some(t) = o.pointer("/proxySettings/tag").and_then(|t| t.as_str()) {
+        v.push(t.to_string());
+    }
+    v
+}
+
+/// Связка из нескольких outbound'ов (цепочка или балансировщик).
+pub fn is_bundle(v: &Value) -> bool {
+    v.get("bundle").and_then(|b| b.as_bool()).unwrap_or(false)
+}
+
+/// Outbound, по которому показывается сервер: основной или первый из балансировщика.
+pub fn primary(v: &Value) -> &Value {
+    if !is_bundle(v) {
+        return v;
+    }
+    let list = v["outbounds"].as_array();
+    let main = v["main"].as_str();
+    let is_proxy = |o: &&Value| o["protocol"].as_str().map(|p| XRAY_PROTOCOLS.contains(&p)).unwrap_or(false);
+    list.and_then(|l| {
+        l.iter()
+            .find(|o| main.is_some() && o["tag"].as_str() == main)
+            .or_else(|| l.iter().find(is_proxy))
+    })
+    .unwrap_or(v)
+}
+
+/// Домены всех серверов связки (для прямого DNS).
+pub fn hosts(v: &Value) -> Vec<String> {
+    let list: Vec<&Value> = if is_bundle(v) {
+        v["outbounds"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
+    } else {
+        vec![v]
+    };
+    list.into_iter()
+        .map(|o| outbound_endpoint(o).0)
+        .filter(|h| !h.is_empty() && h.parse::<std::net::IpAddr>().is_err())
+        .map(|h| h.to_lowercase())
+        .collect()
 }
 
 fn clean_outbound(ob: &Value) -> Value {
@@ -312,7 +506,6 @@ fn clean_outbound(ob: &Value) -> Value {
             .and_then(|s| s.get_mut("sockopt"))
             .and_then(|s| s.as_object_mut())
         {
-            // Цепочки через другие outbound'ы (фрагментация и т.п.) не переносятся.
             sock.remove("dialerProxy");
         }
     }
@@ -371,9 +564,13 @@ pub fn build_config(
     let mut inbounds = vec![];
     let mut outbounds = vec![];
     let mut rules = vec![];
+    let mut balancers = vec![];
+    let mut observe: Vec<String> = vec![];
+    let mut burst: Vec<String> = vec![];
+    let mut observatory: Option<Value> = None;
+    let mut burst_cfg: Option<Value> = None;
     for e in entries {
         let in_tag = format!("in-{}", e.tag);
-        let out_tag = format!("out-{}", e.tag);
         inbounds.push(json!({
             "tag": in_tag,
             "listen": "127.0.0.1",
@@ -386,24 +583,69 @@ pub fn build_config(
                 "ip": "127.0.0.1"
             }
         }));
-        let mut ob = e.outbound.clone();
-        ob["tag"] = json!(out_tag);
-        // Адрес сервера разрешаем встроенным DNS Xray: запрос уходит из xray.exe,
-        // и sing-box отпускает его напрямую, без петли через VPN.
-        let ss = ob
-            .as_object_mut()
-            .unwrap()
-            .entry("streamSettings")
-            .or_insert_with(|| json!({}));
-        if let Some(ss) = ss.as_object_mut() {
-            let sock = ss.entry("sockopt").or_insert_with(|| json!({}));
-            if let Some(sock) = sock.as_object_mut() {
-                sock.entry("domainStrategy")
-                    .or_insert_with(|| json!(if ipv6 { "UseIP" } else { "UseIPv4" }));
+        if !is_bundle(e.outbound) {
+            let out_tag = format!("out-{}", e.tag);
+            let mut ob = e.outbound.clone();
+            ob["tag"] = json!(out_tag);
+            set_resolver(&mut ob, ipv6);
+            outbounds.push(ob);
+            rules.push(json!({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag}));
+            continue;
+        }
+        // Связка: теги получают префикс сервера, ссылки между ними переписываются.
+        let pre = |t: &str| format!("{}~{}", e.tag, t);
+        for ob in e.outbound["outbounds"].as_array().into_iter().flatten() {
+            let mut ob = ob.clone();
+            let t = ob["tag"].as_str().unwrap_or("").to_string();
+            ob["tag"] = json!(pre(&t));
+            if let Some(d) = ob.pointer("/streamSettings/sockopt/dialerProxy").and_then(|d| d.as_str()) {
+                let d = pre(d);
+                ob["streamSettings"]["sockopt"]["dialerProxy"] = json!(d);
+            }
+            if let Some(d) = ob.pointer("/proxySettings/tag").and_then(|d| d.as_str()) {
+                let d = pre(d);
+                ob["proxySettings"]["tag"] = json!(d);
+            }
+            set_resolver(&mut ob, ipv6);
+            outbounds.push(ob);
+        }
+        match e.outbound.get("balancer").filter(|b| b.is_object()) {
+            Some(b) => {
+                let mut b = b.clone();
+                let bt = pre(b["tag"].as_str().unwrap_or("balancer"));
+                b["tag"] = json!(bt);
+                let sel: Vec<String> = b["selector"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).map(|x| pre(x)).collect())
+                    .unwrap_or_default();
+                b["selector"] = json!(sel);
+                if let Some(fb) = b["fallbackTag"].as_str() {
+                    let fb = pre(fb);
+                    b["fallbackTag"] = json!(fb);
+                }
+                match b.pointer("/strategy/type").and_then(|t| t.as_str()) {
+                    Some("leastPing") => {
+                        observe.extend(sel.iter().cloned());
+                        if observatory.is_none() {
+                            observatory = e.outbound.get("observatory").cloned();
+                        }
+                    }
+                    Some("leastLoad") => {
+                        burst.extend(sel.iter().cloned());
+                        if burst_cfg.is_none() {
+                            burst_cfg = e.outbound.get("burstObservatory").cloned();
+                        }
+                    }
+                    _ => {}
+                }
+                rules.push(json!({"type": "field", "inboundTag": [in_tag], "balancerTag": bt}));
+                balancers.push(b);
+            }
+            None => {
+                let main = e.outbound["main"].as_str().unwrap_or("");
+                rules.push(json!({"type": "field", "inboundTag": [in_tag], "outboundTag": pre(main)}));
             }
         }
-        outbounds.push(ob);
-        rules.push(json!({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag}));
     }
     outbounds.push(json!({"protocol": "freedom", "tag": "direct"}));
     let level = match log_level {
@@ -412,13 +654,45 @@ pub fn build_config(
         "info" => "info",
         _ => "warning",
     };
-    json!({
+    let mut cfg = json!({
         "log": {"loglevel": level},
         "dns": {"servers": [dns], "queryStrategy": if ipv6 { "UseIP" } else { "UseIPv4" }},
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": rules}
-    })
+    });
+    if !balancers.is_empty() {
+        cfg["routing"]["balancers"] = json!(balancers);
+    }
+    if !observe.is_empty() {
+        let mut o = observatory.unwrap_or_else(|| {
+            json!({"probeURL": "https://www.gstatic.com/generate_204", "probeInterval": "1m", "enableConcurrency": true})
+        });
+        o["subjectSelector"] = json!(observe);
+        cfg["observatory"] = o;
+    }
+    if !burst.is_empty() {
+        let mut o = burst_cfg.unwrap_or_else(|| {
+            json!({"pingConfig": {"destination": "https://www.gstatic.com/generate_204", "interval": "1m", "timeout": "5s", "sampling": 2}})
+        });
+        o["subjectSelector"] = json!(burst);
+        cfg["burstObservatory"] = o;
+    }
+    cfg
+}
+
+/// Адрес сервера разрешаем встроенным DNS Xray: запрос уходит из процесса Xray,
+/// и sing-box отпускает его напрямую, без петли через VPN.
+fn set_resolver(ob: &mut Value, ipv6: bool) {
+    let Some(o) = ob.as_object_mut() else { return };
+    let ss = o.entry("streamSettings").or_insert_with(|| json!({}));
+    if let Some(ss) = ss.as_object_mut() {
+        let sock = ss.entry("sockopt").or_insert_with(|| json!({}));
+        if let Some(sock) = sock.as_object_mut() {
+            sock.entry("domainStrategy")
+                .or_insert_with(|| json!(if ipv6 { "UseIP" } else { "UseIPv4" }));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -481,5 +755,58 @@ mod tests {
         assert_eq!(c["routing"]["rules"][0]["outboundTag"], "out-s1");
         assert_eq!(c["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");
         assert_eq!(c["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"], "h.example.com");
+    }
+
+    /// Цепочка: трафик идёт в «proxy» (XHTTP), а он подключается через
+    /// промежуточный сервер. Первым в списке стоит промежуточный — раньше
+    /// приложение ошибочно брало его и рвало цепочку.
+    #[test]
+    fn xray_json_chain() {
+        let cfg = json!({"remarks": "DE", "outbounds": [
+            {"tag": "relay", "protocol": "vless", "settings": {"vnext": [{"address": "ru.example.com", "port": 443, "users": [{"id": "r"}]}]},
+             "streamSettings": {"network": "raw", "security": "reality"}},
+            {"tag": "de", "protocol": "vless", "settings": {"vnext": [{"address": "de.example.com", "port": 443, "users": [{"id": "u"}]}]},
+             "streamSettings": {"network": "xhttp", "security": "reality", "sockopt": {"dialerProxy": "relay"}}},
+            {"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["geosite:private"], "outboundTag": "direct"},
+                {"type": "field", "network": "tcp,udp", "outboundTag": "de"}]}});
+        let (_, b) = outbound_from_config(&cfg).unwrap();
+        assert!(is_bundle(&b));
+        assert_eq!(b["main"], "de");
+        assert_eq!(b["outbounds"].as_array().unwrap().len(), 2);
+        assert_eq!(primary(&b)["streamSettings"]["network"], "xhttp");
+        assert_eq!(hosts(&b).len(), 2);
+        let x = build_config(&[XrayEntry { tag: "s1", port: 1000, outbound: &b }], "1.1.1.1", false, "warn", ("u", "p"));
+        let obs = x["outbounds"].as_array().unwrap();
+        assert!(obs.iter().any(|o| o["tag"] == "s1~de" && o["streamSettings"]["sockopt"]["dialerProxy"] == "s1~relay"));
+        assert_eq!(x["routing"]["rules"][0]["outboundTag"], "s1~de");
+    }
+
+    #[test]
+    fn xray_json_balancer() {
+        let cfg = json!({"remarks": "Авто", "outbounds": [
+            {"tag": "proxy-1", "protocol": "vless", "settings": {"address": "a.example.com", "port": 443, "id": "u"}, "streamSettings": {"network": "ws", "security": "tls"}},
+            {"tag": "proxy-2", "protocol": "vless", "settings": {"address": "b.example.com", "port": 443, "id": "u"}, "streamSettings": {"network": "ws", "security": "tls"}},
+            {"tag": "direct", "protocol": "freedom"}],
+            "routing": {"balancers": [{"tag": "auto", "selector": ["proxy-"], "strategy": {"type": "leastPing"}}],
+                        "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "auto"}]}});
+        let (_, b) = outbound_from_config(&cfg).unwrap();
+        assert!(is_bundle(&b));
+        let x = build_config(&[XrayEntry { tag: "s2", port: 1001, outbound: &b }], "1.1.1.1", false, "warn", ("u", "p"));
+        assert_eq!(x["routing"]["balancers"][0]["selector"][0], "s2~proxy-");
+        assert_eq!(x["routing"]["rules"][0]["balancerTag"], "s2~auto");
+        assert_eq!(x["observatory"]["subjectSelector"][0], "s2~proxy-");
+    }
+
+    /// Без правил Xray отправляет трафик в первый outbound списка.
+    #[test]
+    fn xray_json_first_outbound_is_default() {
+        let cfg = json!({"outbounds": [
+            {"tag": "main", "protocol": "vless", "settings": {"address": "fi.example.com", "port": 443, "id": "u"}, "streamSettings": {"network": "raw", "security": "reality"}},
+            {"tag": "hy", "protocol": "hysteria", "settings": {"address": "x.example.com", "port": 443}}]});
+        let (_, ob) = outbound_from_config(&cfg).unwrap();
+        assert!(!is_bundle(&ob));
+        assert_eq!(ob["protocol"], "vless");
     }
 }
