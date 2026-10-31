@@ -386,3 +386,4 @@ body.p-android .row.android-only { display: flex; }
   .row input { min-width: 0; flex-basis: 100%; }
   #toast { bottom: calc(96px + env(safe-area-inset-bottom)); }
 }
+.block > div > .switch:first-child, .block > div + .switch { border-top: 1px solid var(--line); }

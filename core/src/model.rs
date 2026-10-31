@@ -224,6 +224,10 @@ pub struct Settings {
     /// Подключаться при запуске приложения.
     #[serde(default)]
     pub auto_connect: bool,
+    /// Если выбранный сервер не отвечает после подключения — переключиться на
+    /// самый быстрый рабочий сервер той же подписки.
+    #[serde(default = "yes")]
+    pub auto_switch: bool,
     /// Если в режиме TUN нет интернета — переключиться на системный прокси.
     #[serde(default = "yes")]
     pub tun_fallback: bool,

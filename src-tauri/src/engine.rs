@@ -63,8 +63,8 @@ pub struct Persisted {
     pub format: u32,
 }
 
-/// 2 — конфиги Xray подписок сохраняются целиком (цепочки и балансировщики).
-const FORMAT: u32 = 2;
+/// 3 — конфиги Xray подписок сохраняются целиком (цепочки, балансировщики, DNS).
+const FORMAT: u32 = 3;
 
 #[derive(Default)]
 struct Rt {
@@ -292,6 +292,8 @@ impl Engine {
             http,
         });
         engine.save();
+        // Остатки временной проверки серверов.
+        let _ = std::fs::remove_dir_all(engine.paths.data.join("probe"));
         // На Android ядрами управляет VPN-сервис, он может работать и без окна.
         if PLATFORM != Platform::Android {
             crate::procs::kill_orphans(&engine.paths.singbox);
@@ -794,12 +796,13 @@ impl Engine {
             }
             rt.gen
         };
-        // Проверка интернета в режиме TUN идёт в фоне: подключение уже работает,
-        // а если у провайдера TUN не даёт интернета — переключимся на прокси.
-        if res.is_ok() && PLATFORM != Platform::Android && mode == Mode::Tun && settings.tun_fallback {
+        // Проверка идёт уже после подключения, в фоне: отвечает ли сервер и
+        // (в режиме TUN на Windows) есть ли через туннель интернет.
+        let _ = settings;
+        if res.is_ok() {
             self.rt.lock().unwrap().checking = true;
             let me = self.clone();
-            tauri::async_runtime::spawn(async move { me.tun_watch(gen).await });
+            tauri::async_runtime::spawn(async move { me.health_watch(gen).await });
         }
         res.map(|_| self.status())
     }
@@ -1204,26 +1207,74 @@ impl Engine {
         }
     }
 
-    /// Фоновая проверка после подключения в режиме TUN (Windows).
-    async fn tun_watch(self: Arc<Self>, gen: u64) {
+    /// Фоновая проверка после подключения. Если выбранный сервер не отвечает —
+    /// переключает на самый быстрый рабочий (настройка «auto_switch»). Если в
+    /// режиме TUN на Windows сервер работает, а интернета нет — включает
+    /// системный прокси (настройка «tun_fallback»).
+    async fn health_watch(self: Arc<Self>, gen: u64) {
         let same = |me: &Self| {
             let rt = me.rt.lock().unwrap();
-            rt.gen == gen && rt.child.is_some() && !rt.busy
+            rt.gen == gen && Self::live(&rt) && !rt.busy && !rt.paused
         };
         let done = |me: &Self| me.rt.lock().unwrap().checking = false;
-        if self.internet_works().await || !same(&self) {
+
+        // Ядру нужно мгновение, чтобы автовыбор проверил серверы.
+        let mut ok = self.server_delay(TAG_PROXY).await.is_some();
+        if !ok && same(&self) {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            ok = self.server_delay(TAG_PROXY).await.is_some();
+        }
+        if !same(&self) {
             done(&self);
             return;
         }
-        self.log("[app] через TUN нет интернета, проверяю сервер");
-        // Выбранный вручную сервер не меняем: если он не отвечает, сообщаем об этом.
-        let tun_broken = self.server_delay(TAG_PROXY).await.is_some();
-        if !tun_broken && same(&self) {
-            self.rt.lock().unwrap().notice =
-                Some("Сервер не отвечает — выберите другой или включите автовыбор".into());
-            self.log("[app] сервер не отвечает");
+        let settings = self.settings();
+        if !ok {
+            let old = {
+                let st = self.state.lock().unwrap();
+                Self::selected_name(&st).map(|n| n.0).unwrap_or_default()
+            };
+            if !settings.auto_switch {
+                self.log("[app] сервер не отвечает");
+                self.rt.lock().unwrap().notice = Some(format!("«{old}» не отвечает — выберите другой сервер"));
+                done(&self);
+                return;
+            }
+            self.log("[app] сервер не отвечает, ищу рабочий");
+            let sub_id = self.rt.lock().unwrap().active_sub.clone().unwrap_or_default();
+            let best = self
+                .ping(&sub_id)
+                .await
+                .into_iter()
+                .filter(|(_, ms)| *ms > 0)
+                .min_by_key(|(_, ms)| *ms)
+                .map(|(id, _)| id);
+            if !same(&self) {
+                done(&self);
+                return;
+            }
+            match best {
+                Some(best) if self.clash_select(&best).await.is_ok() => {
+                    let new = {
+                        let mut st = self.state.lock().unwrap();
+                        st.selected = Some(best.clone());
+                        Self::selected_name(&st).map(|n| n.0).unwrap_or_default()
+                    };
+                    self.save();
+                    self.refresh_profile();
+                    self.log(format!("[app] переключено на «{new}»"));
+                    self.rt.lock().unwrap().notice = Some(format!("«{old}» не отвечал — подключено через «{new}»"));
+                }
+                _ => {
+                    self.rt.lock().unwrap().notice = Some("Ни один сервер подписки сейчас не отвечает".into());
+                }
+            }
+            done(&self);
+            return;
         }
-        if !tun_broken || !same(&self) {
+
+        let tun = PLATFORM != Platform::Android && self.rt.lock().unwrap().mode == Mode::Tun;
+        if !tun || !settings.tun_fallback || self.internet_works().await || !same(&self) {
             done(&self);
             return;
         }
@@ -1246,7 +1297,7 @@ impl Engine {
         match res {
             Ok(()) => {
                 rt.notice = Some(
-                    "В режиме TUN не было интернета (такое бывает у некоторых провайдеров) — включён системный прокси".into(),
+                    "В режиме TUN не было интернета (такое бывает у некоторых провайдеров) — включён системный прокси. В этом режиме браузер может показать сайтам ваш настоящий IP через WebRTC".into(),
                 )
             }
             Err(e) => rt.last_error = Some(e),
@@ -1268,7 +1319,7 @@ impl Engine {
             "http://cp.cloudflare.com/generate_204",
             "http://www.gstatic.com/generate_204",
         ];
-        for attempt in 0..3 {
+        for attempt in 0..2 {
             // Оба адреса проверяются одновременно, хватит одного ответа.
             let checks = URLS.iter().map(|u| {
                 let c = client.clone();
@@ -1283,7 +1334,7 @@ impl Engine {
             if join_all(checks).await.into_iter().any(|ok| ok) {
                 return true;
             }
-            if attempt < 2 {
+            if attempt < 1 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
@@ -1497,9 +1548,11 @@ impl Engine {
         })
     }
 
-    /// Задержка до серверов подписки, мс. Если ядро запущено с этой подпиской —
-    /// реальная проверка через сервер (URL-тест), иначе TCP-пинг.
-    /// 0 — нет ответа, -1 — UDP-протокол, проверить без подключения нельзя.
+    /// Задержка до серверов подписки, мс: настоящий запрос через каждый сервер.
+    /// Если подключено к этой подписке — через работающее ядро, иначе ядро
+    /// запускается на время проверки. TCP-пинг остаётся запасным вариантом: он
+    /// не показывает, работает ли сервер, а чужой VPN в режиме TUN отвечает на
+    /// него сам за 1 мс. 0 — нет ответа, -1 — проверить не удалось (UDP).
     pub async fn ping(&self, sub_id: &str) -> HashMap<String, i64> {
         let servers: Vec<Server> = {
             let st = self.state.lock().unwrap();
@@ -1514,20 +1567,39 @@ impl Engine {
             self.reap(&mut rt);
             Self::live(&rt) && !rt.paused && rt.active_sub.as_deref() == Some(sub_id)
         };
-        let (base, secret) = self.clash_base();
-        let tasks: Vec<_> = servers
-            .into_iter()
-            .map(|s| {
-                let http = self.http.clone();
-                let base = base.clone();
-                let secret = secret.clone();
-                async move {
-                    let ms = if live {
-                        let url = format!(
-                            "{base}/proxies/{}/delay?timeout=5000&url={}",
-                            s.id, URL_TEST
-                        );
-                        match http.get(url).bearer_auth(secret).send().await {
+        let ids: Vec<String> = servers.iter().map(|s| s.id.clone()).collect();
+        if live {
+            let (base, secret) = self.clash_base();
+            return self.delays(&base, &secret, ids).await;
+        }
+        match self.probe(&servers).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.log(format!("[app] проверка через ядро не удалась ({e}), TCP-пинг"));
+                let tasks = servers.into_iter().map(|s| async move {
+                    let ms = if s.is_udp() { -1 } else { tcp_ping(&s.address, s.port).await.unwrap_or(0) };
+                    (s.id, ms)
+                });
+                join_all(tasks).await.into_iter().collect()
+            }
+        }
+    }
+
+    /// URL-тест каждого сервера через Clash API ядра.
+    async fn delays(&self, base: &str, secret: &str, ids: Vec<String>) -> HashMap<String, i64> {
+        let mut out = HashMap::new();
+        let mut iter = ids.into_iter();
+        loop {
+            // Ограничиваем параллельность, чтобы не душить сеть на больших подписках.
+            let chunk: Vec<_> = iter
+                .by_ref()
+                .take(24)
+                .map(|id| {
+                    let http = self.http.clone();
+                    let url = format!("{base}/proxies/{id}/delay?timeout=5000&url={URL_TEST}");
+                    let secret = secret.to_string();
+                    async move {
+                        let ms = match http.get(url).bearer_auth(secret).send().await {
                             Ok(r) => r
                                 .json::<serde_json::Value>()
                                 .await
@@ -1535,29 +1607,97 @@ impl Engine {
                                 .and_then(|v| v["delay"].as_i64())
                                 .unwrap_or(0),
                             Err(_) => 0,
-                        }
-                    } else if s.is_udp() {
-                        -1
-                    } else {
-                        tcp_ping(&s.address, s.port).await.unwrap_or(0)
-                    };
-                    (s.id, ms)
-                }
-            })
-            .collect();
-        // Ограничиваем параллельность, чтобы не душить сеть на больших подписках.
-        let mut out = HashMap::new();
-        let mut iter = tasks.into_iter();
-        loop {
-            let chunk: Vec<_> = iter.by_ref().take(24).collect();
+                        };
+                        (id, ms)
+                    }
+                })
+                .collect();
             if chunk.is_empty() {
                 break;
             }
-            for (id, ms) in join_all(chunk).await {
-                out.insert(id, ms);
-            }
+            out.extend(join_all(chunk).await);
         }
         out
+    }
+
+    /// Временно запускает ядра без входящих подключений и проверяет серверы.
+    async fn probe(&self, servers: &[Server]) -> Result<HashMap<String, i64>, String> {
+        if servers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if !self.paths.singbox.exists() {
+            return Err("нет ядра sing-box".into());
+        }
+        let (built, run) = {
+            let st = self.state.lock().unwrap();
+            let mut settings = st.settings.clone();
+            settings.allow_lan = false;
+            settings.log_level = "error".into();
+            settings.split.app_mode = AppMode::Off;
+            let refs: Vec<&Server> = servers.iter().collect();
+            let n_xray = if self.paths.xray.exists() { singbox::xray_count(&refs, &settings) } else { 0 };
+            let mut ports = free_ports(1 + n_xray)?;
+            let run = Runtime {
+                mixed_port: 0,
+                mixed_auth: false,
+                clash_port: ports.remove(0),
+                secret: random_token(),
+                socks_user: random_token()[..10].to_string(),
+                socks_pass: random_token(),
+                xray_ports: ports,
+            };
+            let built = singbox::build(&BuildInput {
+                settings: &settings,
+                servers: refs,
+                default: servers[0].id.clone(),
+                ruleset_dir: Some(&self.paths.ruleset_dir),
+                xray_process: self.paths.xray.exists().then_some(XRAY_EXE),
+                mode: Mode::Proxy,
+                platform: PLATFORM,
+                runtime: &run,
+            })?;
+            (built, run)
+        };
+        let dir = self.paths.data.join("probe").join(&random_token()[..8]);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut guard = Probe { children: vec![], dir: dir.clone() };
+        if let Some(x) = &built.xray {
+            let p = dir.join("xray.json");
+            write_private(&p, x)?;
+            guard.children.push(self.spawn(&self.paths.xray, &["run".as_ref(), "-c".as_ref(), p.as_os_str()], "[проверка xray] ")?);
+        }
+        let p = dir.join("config.json");
+        write_private(&p, &built.singbox)?;
+        guard.children.push(self.spawn(
+            &self.paths.singbox,
+            &["run".as_ref(), "-c".as_ref(), p.as_os_str(), "-D".as_ref(), dir.as_os_str(), "--disable-color".as_ref()],
+            "[проверка] ",
+        )?);
+        let base = format!("http://127.0.0.1:{}", run.clash_port);
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if guard.children.iter_mut().any(|c| matches!(c.try_wait(), Ok(Some(_)))) {
+                return Err("ядро завершилось".into());
+            }
+            let ok = self
+                .http
+                .get(format!("{base}/version"))
+                .bearer_auth(&run.secret)
+                .timeout(Duration::from_millis(500))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if ok {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("ядро не ответило".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let ids = servers.iter().map(|s| s.id.clone()).collect();
+        Ok(self.delays(&base, &run.secret, ids).await)
     }
 
     /// Полный выход из приложения: всё останавливается, интернет разблокируется.
@@ -1583,6 +1723,22 @@ pub fn find_selection<'a>(
                 .find(|s| s.id == id)
                 .map(|srv| (sub, Some(srv)))
         }),
+    }
+}
+
+/// Процессы временной проверки серверов: останавливаются в любом случае.
+struct Probe {
+    children: Vec<Child>,
+    dir: PathBuf,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        for c in self.children.iter_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

@@ -111,7 +111,7 @@ function renderHome() {
   $("#power").setAttribute("aria-label", on && !paused ? "Отключить" : "Подключить");
   $("#state-title").textContent = busy ? "Подключение…" : paused ? "Пауза" : on ? "Подключено" : "Не подключено";
   $("#state-pill-text").textContent = busy ? "Подключение" : paused ? "VPN на паузе"
-    : on ? (status.checking ? "Проверяю интернет…" : "Защищено") : "Не подключено";
+    : on ? (status.checking ? "Проверяю соединение…" : "Защищено") : "Не подключено";
   const sub = $("#state-sub");
   sub.classList.remove("error");
   if (!status?.core_found) {
@@ -475,6 +475,7 @@ const FIELDS = [
 const CHECKS = [
   ["#s-ipv6", "ipv6"], ["#s-lan", "allow_lan"], ["#s-auto", "auto_connect"], ["#s-autostart", "autostart"],
   ["#s-killswitch", "kill_switch"], ["#s-fallback", "tun_fallback"], ["#s-notify", "notification"],
+  ["#s-autoswitch", "auto_switch"],
 ];
 
 function renderSettings() {

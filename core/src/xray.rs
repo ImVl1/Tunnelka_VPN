@@ -283,11 +283,11 @@ const XRAY_PROTOCOLS: &[&str] = &["vless", "vmess", "trojan", "shadowsocks", "hy
 /// Из одного конфига Xray подписки достаёт то, через что идёт трафик: основной
 /// outbound (как выбрал бы сам Xray по правилам маршрутизации) или балансировщик.
 ///
-/// Если основной outbound ни от чего не зависит, возвращается он сам. Если он
-/// подключается через другие outbound'ы (`dialerProxy`, `proxySettings` —
-/// цепочки, «белые списки», фрагментация) или это балансировщик, возвращается
-/// «связка»: `{"bundle": true, "main": ..., "outbounds": [...], "balancer": ...}`.
-/// Её целиком запускает Xray, как в исходном конфиге.
+/// Возвращается «связка»: `{"bundle": true, "main": ..., "outbounds": [...],
+/// "balancer": ..., "dns": ...}` — основной outbound вместе со всем, через что он
+/// подключается (`dialerProxy`, `proxySettings`: цепочки, «белые списки»,
+/// фрагментация), балансировщик и DNS конфига. Xray запускает её так же, как
+/// исходный конфиг.
 pub fn outbound_from_config(cfg: &Value) -> Option<(String, Value)> {
     let obs: Vec<&Value> = cfg.get("outbounds")?.as_array()?.iter().collect();
     let tag_of = |o: &Value| o.get("tag").and_then(|t| t.as_str()).unwrap_or("").to_string();
@@ -383,10 +383,6 @@ pub fn outbound_from_config(cfg: &Value) -> Option<(String, Value)> {
             }
         }
     }
-    let has_deps = need.len() > 1 || balancer.is_some();
-    if !has_deps {
-        return Some((name, clean_outbound(primary)));
-    }
     // Связка: outbound'ы в исходном порядке, без тех, что не нужны.
     let mut list: Vec<Value> = vec![];
     for (i, o) in obs.iter().enumerate() {
@@ -420,6 +416,11 @@ pub fn outbound_from_config(cfg: &Value) -> Option<(String, Value)> {
         "main": main.map(|o| tag_of(o)),
         "outbounds": list,
     });
+    // DNS из конфига: адреса серверов могут быть закреплены в hosts, а провайдер
+    // может рассчитывать на свои DNS-серверы.
+    if let Some(d) = dns_of(cfg) {
+        bundle["dns"] = d;
+    }
     if let Some(b) = balancer {
         bundle["balancer"] = b;
         for key in ["observatory", "burstObservatory"] {
@@ -495,21 +496,55 @@ pub fn hosts(v: &Value) -> Vec<String> {
         .collect()
 }
 
-fn clean_outbound(ob: &Value) -> Value {
-    let mut ob = ob.clone();
-    if let Some(o) = ob.as_object_mut() {
-        o.remove("tag");
-        o.remove("sendThrough");
-        o.remove("proxySettings");
-        if let Some(sock) = o
-            .get_mut("streamSettings")
-            .and_then(|s| s.get_mut("sockopt"))
-            .and_then(|s| s.as_object_mut())
-        {
-            sock.remove("dialerProxy");
+/// hosts и DNS-серверы конфига. Записи с geosite/geoip пропускаются: баз
+/// Xray в приложении нет, а без них Xray не запустится.
+fn dns_of(cfg: &Value) -> Option<Value> {
+    let d = cfg.get("dns")?;
+    let geo = |s: &str| s.starts_with("geosite:") || s.starts_with("geoip:") || s.starts_with("ext:");
+    let mut hosts = Map::new();
+    if let Some(h) = d.get("hosts").and_then(|h| h.as_object()) {
+        for (k, v) in h {
+            if !geo(k) {
+                hosts.insert(k.clone(), v.clone());
+            }
         }
     }
-    ob
+    let mut servers = vec![];
+    for sv in d.get("servers").and_then(|s| s.as_array()).into_iter().flatten() {
+        let addr = match sv {
+            Value::String(a) => Some(sv.clone()).filter(|_| !a.is_empty()),
+            Value::Object(o) => {
+                // Серверы только для отдельных доменов не переносим.
+                let scoped = o.get("domains").and_then(|d| d.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+                match o.get("address").and_then(|a| a.as_str()) {
+                    Some(a) if !scoped => {
+                        let mut m = Map::new();
+                        m.insert("address".into(), json!(a));
+                        if let Some(p) = o.get("port") {
+                            m.insert("port".into(), p.clone());
+                        }
+                        Some(Value::Object(m))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let skip = addr
+            .as_ref()
+            .map(|a| {
+                let s = a.as_str().or_else(|| a["address"].as_str()).unwrap_or("");
+                s == "fakedns" || s.is_empty()
+            })
+            .unwrap_or(true);
+        if !skip {
+            servers.push(addr.unwrap());
+        }
+    }
+    if hosts.is_empty() && servers.is_empty() {
+        return None;
+    }
+    Some(json!({"hosts": hosts, "servers": servers}))
 }
 
 /// Адрес и порт сервера из outbound Xray (плоский формат или vnext/servers).
@@ -565,6 +600,8 @@ pub fn build_config(
     let mut outbounds = vec![];
     let mut rules = vec![];
     let mut balancers = vec![];
+    let mut dns_hosts = Map::new();
+    let mut dns_servers: Vec<Value> = vec![];
     let mut observe: Vec<String> = vec![];
     let mut burst: Vec<String> = vec![];
     let mut observatory: Option<Value> = None;
@@ -591,6 +628,18 @@ pub fn build_config(
             outbounds.push(ob);
             rules.push(json!({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag}));
             continue;
+        }
+        if let Some(d) = e.outbound.get("dns") {
+            if let Some(h) = d["hosts"].as_object() {
+                for (k, v) in h {
+                    dns_hosts.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            for sv in d["servers"].as_array().into_iter().flatten() {
+                if !dns_servers.contains(sv) {
+                    dns_servers.push(sv.clone());
+                }
+            }
         }
         // Связка: теги получают префикс сервера, ссылки между ними переписываются.
         let pre = |t: &str| format!("{}~{}", e.tag, t);
@@ -647,7 +696,15 @@ pub fn build_config(
             }
         }
     }
-    outbounds.push(json!({"protocol": "freedom", "tag": "direct"}));
+    // Первый outbound — исходящий по умолчанию. Это должен быть прямой выход:
+    // через него Xray сам разрешает адреса серверов.
+    outbounds.insert(0, json!({"protocol": "freedom", "tag": "direct"}));
+    rules.insert(0, json!({"type": "field", "inboundTag": ["xray-dns"], "outboundTag": "direct"}));
+    // Сначала DNS из подписки, затем наш прямой DNS как запасной.
+    let fallback = json!(dns);
+    if !dns_servers.contains(&fallback) {
+        dns_servers.push(fallback);
+    }
     let level = match log_level {
         "debug" => "debug",
         "error" => "error",
@@ -656,7 +713,12 @@ pub fn build_config(
     };
     let mut cfg = json!({
         "log": {"loglevel": level},
-        "dns": {"servers": [dns], "queryStrategy": if ipv6 { "UseIP" } else { "UseIPv4" }},
+        "dns": {
+            "tag": "xray-dns",
+            "hosts": dns_hosts,
+            "servers": dns_servers,
+            "queryStrategy": if ipv6 { "UseIP" } else { "UseIPv4" }
+        },
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": rules}
@@ -738,12 +800,13 @@ mod tests {
             {"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{"address": "de.example.com", "port": 443, "users": [{"id": "u", "encryption": "none"}]}]},
              "streamSettings": {"network": "xhttp", "security": "reality", "sockopt": {"dialerProxy": "fragment"}}},
             {"tag": "direct", "protocol": "freedom"}]});
-        let (name, ob) = outbound_from_config(&cfg).unwrap();
+        let (name, b) = outbound_from_config(&cfg).unwrap();
         assert_eq!(name, "🇩🇪 DE");
-        assert!(ob.get("tag").is_none());
+        let ob = primary(&b);
+        // Ссылка на несуществующий outbound убрана.
         assert!(ob["streamSettings"]["sockopt"].get("dialerProxy").is_none());
-        assert_eq!(outbound_endpoint(&ob), ("de.example.com".to_string(), 443));
-        assert_eq!(outbound_label(&ob), "xhttp · reality");
+        assert_eq!(outbound_endpoint(ob), ("de.example.com".to_string(), 443));
+        assert_eq!(outbound_label(ob), "xhttp · reality");
     }
 
     #[test]
@@ -752,9 +815,9 @@ mod tests {
         let c = build_config(&[XrayEntry { tag: "s1", port: 10800, outbound: &ob }], "77.88.8.8", false, "info", ("u", "p"));
         assert_eq!(c["inbounds"][0]["settings"]["accounts"][0]["pass"], "p");
         assert_eq!(c["inbounds"][0]["port"], 10800);
-        assert_eq!(c["routing"]["rules"][0]["outboundTag"], "out-s1");
-        assert_eq!(c["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");
-        assert_eq!(c["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"], "h.example.com");
+        assert_eq!(c["routing"]["rules"][1]["outboundTag"], "out-s1");
+        assert_eq!(c["outbounds"][1]["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");
+        assert_eq!(c["outbounds"][1]["streamSettings"]["tlsSettings"]["serverName"], "h.example.com");
     }
 
     /// Цепочка: трафик идёт в «proxy» (XHTTP), а он подключается через
@@ -780,7 +843,7 @@ mod tests {
         let x = build_config(&[XrayEntry { tag: "s1", port: 1000, outbound: &b }], "1.1.1.1", false, "warn", ("u", "p"));
         let obs = x["outbounds"].as_array().unwrap();
         assert!(obs.iter().any(|o| o["tag"] == "s1~de" && o["streamSettings"]["sockopt"]["dialerProxy"] == "s1~relay"));
-        assert_eq!(x["routing"]["rules"][0]["outboundTag"], "s1~de");
+        assert_eq!(x["routing"]["rules"][1]["outboundTag"], "s1~de");
     }
 
     #[test]
@@ -795,7 +858,7 @@ mod tests {
         assert!(is_bundle(&b));
         let x = build_config(&[XrayEntry { tag: "s2", port: 1001, outbound: &b }], "1.1.1.1", false, "warn", ("u", "p"));
         assert_eq!(x["routing"]["balancers"][0]["selector"][0], "s2~proxy-");
-        assert_eq!(x["routing"]["rules"][0]["balancerTag"], "s2~auto");
+        assert_eq!(x["routing"]["rules"][1]["balancerTag"], "s2~auto");
         assert_eq!(x["observatory"]["subjectSelector"][0], "s2~proxy-");
     }
 
@@ -805,8 +868,25 @@ mod tests {
         let cfg = json!({"outbounds": [
             {"tag": "main", "protocol": "vless", "settings": {"address": "fi.example.com", "port": 443, "id": "u"}, "streamSettings": {"network": "raw", "security": "reality"}},
             {"tag": "hy", "protocol": "hysteria", "settings": {"address": "x.example.com", "port": 443}}]});
-        let (_, ob) = outbound_from_config(&cfg).unwrap();
-        assert!(!is_bundle(&ob));
-        assert_eq!(ob["protocol"], "vless");
+        let (_, b) = outbound_from_config(&cfg).unwrap();
+        assert_eq!(primary(&b)["protocol"], "vless");
+        assert_eq!(b["outbounds"].as_array().unwrap().len(), 1);
+    }
+
+    /// hosts и DNS-серверы конфига переносятся, geosite — нет; прямой выход —
+    /// первый, и DNS самого Xray идёт через него.
+    #[test]
+    fn xray_json_dns() {
+        let cfg = json!({"outbounds": [
+            {"tag": "proxy", "protocol": "vless", "settings": {"address": "nl.example.com", "port": 443, "id": "u"}}],
+            "dns": {"hosts": {"nl.example.com": "5.6.7.8", "geosite:category-ads-all": "127.0.0.1"},
+                    "servers": ["https://1.1.1.1/dns-query", {"address": "8.8.8.8", "domains": ["geosite:google"]}, "fakedns"]}});
+        let (_, b) = outbound_from_config(&cfg).unwrap();
+        let x = build_config(&[XrayEntry { tag: "s", port: 1, outbound: &b }], "77.88.8.8", false, "warn", ("u", "p"));
+        assert_eq!(x["outbounds"][0]["tag"], "direct");
+        assert_eq!(x["dns"]["hosts"]["nl.example.com"], "5.6.7.8");
+        assert!(x["dns"]["hosts"].get("geosite:category-ads-all").is_none());
+        assert_eq!(x["dns"]["servers"], json!(["https://1.1.1.1/dns-query", "77.88.8.8"]));
+        assert_eq!(x["routing"]["rules"][0]["inboundTag"][0], "xray-dns");
     }
 }
