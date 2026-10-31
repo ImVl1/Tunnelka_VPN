@@ -325,13 +325,15 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
                     members.push(tag);
                 }
                 groups.insert(s.id.clone(), members.clone());
+                // Группа пассивная: сама она серверы не проверяет (иначе при каждом
+                // подключении — десятки соединений разом). Лучший сервер внутри
+                // выбирает приложение, понемногу; до этого работает первый.
                 json!({
-                    "type": "urltest",
+                    "type": "selector",
                     "tag": s.id,
                     "outbounds": members,
-                    "url": URL_TEST,
-                    "interval": "3m",
-                    "tolerance": 50
+                    "default": members[0],
+                    "interrupt_exist_connections": false
                 })
             }
         } else {
@@ -362,8 +364,10 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             "interrupt_exist_connections": true
         }),
     );
-    outbounds.insert(
-        1,
+    // Общий автовыбор проверяет все серверы подписки (включая части групп).
+    // Это нужно, только когда выбран он сам; иначе группа пассивная, чтобы
+    // каждое подключение не начиналось с десятков проверочных соединений.
+    let auto = if default == TAG_AUTO {
         json!({
             "type": "urltest",
             "tag": TAG_AUTO,
@@ -371,8 +375,17 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             "url": URL_TEST,
             "interval": "5m",
             "tolerance": 50
-        }),
-    );
+        })
+    } else {
+        json!({
+            "type": "selector",
+            "tag": TAG_AUTO,
+            "outbounds": tags,
+            "default": tags[0],
+            "interrupt_exist_connections": false
+        })
+    };
+    outbounds.insert(1, auto);
     outbounds.push(json!({"type": "direct", "tag": TAG_DIRECT}));
 
     // ---- наборы правил ----

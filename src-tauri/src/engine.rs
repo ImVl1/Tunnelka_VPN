@@ -373,28 +373,78 @@ impl Engine {
     // Подписки
     // -----------------------------------------------------------------------
 
-    async fn fetch(&self, url: &str, seed: &str) -> Result<Fetched, String> {
+    /// Скачивает подписку: напрямую (с запасным DNS-over-HTTPS), а если сайт
+    /// подписки заблокирован — через VPN: работающее подключение или временно
+    /// запущенное ядро с уже известными серверами.
+    async fn fetch(&self, url: &str, seed: &str, sub_id: Option<&str>) -> Result<Fetched, String> {
         let ua = self.state.lock().unwrap().settings.user_agent.clone();
-        // В режиме системного прокси само приложение ходит напрямую; если панель
-        // недоступна, пробуем через локальный прокси ядра.
-        let proxy_port = {
-            let rt = self.rt.lock().unwrap();
-            (rt.child.is_some() && rt.mode == Mode::Proxy && PLATFORM == Platform::Windows)
-                .then_some(rt.run.mixed_port)
-                .filter(|p| *p != 0)
+        let first = match subscription::fetch(url, &ua, seed, None).await {
+            Ok(f) => return Ok(f),
+            Err(e) => e,
         };
-        match subscription::fetch(url, &ua, seed, None).await {
-            Ok(f) => Ok(f),
-            Err(e) => match proxy_port {
-                Some(port) => {
-                    let proxy = format!("http://127.0.0.1:{port}");
-                    subscription::fetch(url, &ua, seed, Some(&proxy))
-                        .await
-                        .map_err(|e2| format!("{e}; через VPN: {e2}"))
-                }
-                None => Err(e),
-            },
+        if let Some(proxy) = self.live_proxy() {
+            self.log("[app] подписка напрямую недоступна, загружаю через подключение");
+            return subscription::fetch(url, &ua, seed, Some(&proxy))
+                .await
+                .map_err(|e| format!("{first}; через VPN: {e}"));
         }
+        let servers = self.servers_for_temp(sub_id);
+        if servers.is_empty() {
+            return Err(format!(
+                "{first}. Похоже, сайт подписки заблокирован — подключитесь к любому VPN и добавьте подписку ещё раз, дальше Tunnelka будет обновлять её через свои серверы"
+            ));
+        }
+        self.log("[app] подписка напрямую недоступна, загружаю через временное подключение");
+        let tc = match self.temp_core(&servers, true).await {
+            Ok(tc) => tc,
+            Err(e) => return Err(format!("{first}; через VPN: {e}")),
+        };
+        let proxy = tc.proxy.clone().unwrap_or_default();
+        // Автовыбор проверяет серверы в фоне: если первый не сработал, ждём его.
+        let mut res = Err(String::new());
+        for attempt in 0..3 {
+            res = subscription::fetch(url, &ua, seed, Some(&proxy)).await;
+            if res.is_ok() {
+                break;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+        drop(tc);
+        res.map_err(|e| format!("{first}; через VPN: {e}"))
+    }
+
+    /// Локальный прокси работающего подключения (если он есть).
+    fn live_proxy(&self) -> Option<String> {
+        let mut rt = self.rt.lock().unwrap();
+        self.reap(&mut rt);
+        if !Self::live(&rt) || rt.paused || rt.run.mixed_port == 0 {
+            return None;
+        }
+        Some(if rt.run.mixed_auth {
+            format!("http://{}:{}@127.0.0.1:{}", rt.run.socks_user, rt.run.socks_pass, rt.run.mixed_port)
+        } else {
+            format!("http://127.0.0.1:{}", rt.run.mixed_port)
+        })
+    }
+
+    /// Серверы для временного подключения: этой подписки или любые известные.
+    fn servers_for_temp(&self, sub_id: Option<&str>) -> Vec<Server> {
+        let st = self.state.lock().unwrap();
+        let mut v: Vec<Server> = sub_id
+            .and_then(|id| st.subscriptions.iter().find(|s| s.id == id))
+            .map(|s| s.servers.iter().filter(|x| x.usable()).cloned().collect())
+            .unwrap_or_default();
+        if v.is_empty() {
+            v = st
+                .subscriptions
+                .iter()
+                .flat_map(|s| s.servers.iter().filter(|x| x.usable()).cloned())
+                .take(40)
+                .collect();
+        }
+        v
     }
 
     /// Добавляет подписку по ссылке или, если это не http(s), — серверы из текста.
@@ -418,7 +468,7 @@ impl Engine {
             return Err(format!("подписка уже добавлена: «{}»", existing.name));
         }
         let id = random_token()[..12].to_string();
-        let f = self.fetch(input, &id).await?;
+        let f = self.fetch(input, &id, None).await?;
         let host = input
             .split("://")
             .nth(1)
@@ -516,7 +566,7 @@ impl Engine {
                 .ok_or("подписка не найдена")?;
             sub.url.clone().ok_or("эту группу нельзя обновить")?
         };
-        let res = self.fetch(&url, id).await;
+        let res = self.fetch(&url, id, Some(id)).await;
         {
             let mut st = self.state.lock().unwrap();
             if let Some(sub) = st.subscriptions.iter_mut().find(|s| s.id == id) {
@@ -1226,28 +1276,28 @@ impl Engine {
         };
         let done = |me: &Self| me.rt.lock().unwrap().checking = false;
 
-        // Сервер считается неработающим только после нескольких проверок: сразу
-        // после запуска автовыбор (общий или внутри сервера) ещё мог не успеть
-        // проверить свои серверы — проверку групп запускаем сами.
-        let mut ok = false;
+        // Сервер с автовыбором внутри: сразу выбираем в нём лучший рабочий сервер.
+        let mut ok = match self.selected_group() {
+            Some(g) => self.tune_group(&g).await,
+            None => false,
+        };
+        // Обычный сервер или общий автовыбор: несколько проверок, а не одна —
+        // сразу после запуска соединение может ещё устанавливаться.
         for attempt in 0..3 {
-            if !same(&self) {
+            if ok || !same(&self) {
                 break;
             }
             if self.server_delay(TAG_PROXY).await.is_some() {
                 ok = true;
                 break;
             }
-            let selected = self.state.lock().unwrap().selected.clone();
-            let groups = self.rt.lock().unwrap().groups.clone();
-            let group = match selected.as_deref().map(Selection::parse) {
-                Some(Selection::Auto(_)) => Some(TAG_AUTO.to_string()),
-                Some(Selection::Server(id)) => groups.contains_key(&id).then_some(id),
-                None => None,
-            };
-            if let Some(g) = group {
+            let auto = matches!(
+                self.state.lock().unwrap().selected.as_deref().map(Selection::parse),
+                Some(Selection::Auto(_))
+            );
+            if auto {
                 let (base, secret) = self.clash_base();
-                let _ = group_delay(&self.http, &base, &secret, &g).await;
+                let _ = group_delay(&self.http, &base, &secret, TAG_AUTO).await;
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1284,6 +1334,9 @@ impl Engine {
             }
             match best {
                 Some(best) if self.clash_select(&best).await.is_ok() => {
+                    if self.rt.lock().unwrap().groups.contains_key(&best) {
+                        self.tune_group(&best).await;
+                    }
                     let new = {
                         let mut st = self.state.lock().unwrap();
                         st.selected = Some(best.clone());
@@ -1375,6 +1428,46 @@ impl Engine {
         proxy_delay(&self.http, &base, &secret, tag).await
     }
 
+    /// Выбранный сервер, если у него автовыбор внутри (группа частей).
+    fn selected_group(&self) -> Option<String> {
+        let selected = self.state.lock().unwrap().selected.clone();
+        match selected.as_deref().map(Selection::parse) {
+            Some(Selection::Server(id)) if self.rt.lock().unwrap().groups.contains_key(&id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Проверяет части сервера (не больше 4 одновременно) и переключает группу
+    /// на самую быструю рабочую. false — ни одна не ответила.
+    async fn tune_group(&self, id: &str) -> bool {
+        use futures::stream::{self, StreamExt};
+        let Some(members) = self.rt.lock().unwrap().groups.get(id).cloned() else {
+            return false;
+        };
+        let (base, secret) = self.clash_base();
+        let results: Vec<(String, i64)> = stream::iter(members)
+            .map(|m| {
+                let (base, secret) = (base.clone(), secret.clone());
+                async move {
+                    let ms = proxy_delay(&self.http, &base, &secret, &m).await.unwrap_or(0);
+                    (m, ms)
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+        let Some((best, ms)) = results.into_iter().filter(|(_, ms)| *ms > 0).min_by_key(|(_, ms)| *ms) else {
+            return false;
+        };
+        match self.clash_put(id, &best).await {
+            Ok(()) => {
+                self.log(format!("[app] внутри сервера выбран вариант {best} ({ms} мс)"));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Останавливает ядра, VPN и системный прокси. Kill switch не трогает.
     fn stop_process(&self) {
         let mut rt = self.rt.lock().unwrap();
@@ -1458,7 +1551,12 @@ impl Engine {
             self.reap(&mut rt);
             if Self::live(&rt) && !rt.paused { rt.active_sub.clone() } else { None }
         };
+        let to_auto = matches!(Selection::parse(sel), Selection::Auto(_));
         match active {
+            // Общий автовыбор активен, только если запущен с ним, — перезапуск.
+            Some(_) if to_auto => {
+                self.connect().await?;
+            }
             Some(a) if a == target_sub => {
                 let tag = match Selection::parse(sel) {
                     Selection::Auto(_) => TAG_AUTO.to_string(),
@@ -1469,6 +1567,12 @@ impl Engine {
                     self.connect().await?;
                 } else {
                     self.refresh_profile();
+                    if self.rt.lock().unwrap().groups.contains_key(&tag) {
+                        let me = self.clone();
+                        tauri::async_runtime::spawn(async move {
+                            me.tune_group(&tag).await;
+                        });
+                    }
                 }
             }
             Some(_) => {
@@ -1530,17 +1634,23 @@ impl Engine {
     }
 
     async fn clash_select(&self, tag: &str) -> Result<(), String> {
+        self.clash_put(TAG_PROXY, tag).await?;
+        self.log(format!("[app] сервер переключён: {tag}"));
+        Ok(())
+    }
+
+    /// Выбор внутри группы-селектора sing-box.
+    async fn clash_put(&self, group: &str, tag: &str) -> Result<(), String> {
         let (base, secret) = self.clash_base();
         let r = self
             .http
-            .put(format!("{base}/proxies/{TAG_PROXY}"))
+            .put(format!("{base}/proxies/{group}"))
             .bearer_auth(secret)
             .json(&serde_json::json!({ "name": tag }))
             .send()
             .await
             .map_err(|e| e.to_string())?;
         if r.status().is_success() {
-            self.log(format!("[app] сервер переключён: {tag}"));
             Ok(())
         } else {
             Err(format!("HTTP {}", r.status()))
@@ -1612,9 +1722,10 @@ impl Engine {
         }
     }
 
-    /// URL-тест каждого сервера через Clash API ядра. Для сервера с автовыбором
-    /// внутри проверяются все его части (это же обновляет выбор), результат —
-    /// лучшая из них.
+    /// URL-тест каждого сервера через Clash API ядра. У сервера с автовыбором
+    /// внутри проверяется каждая часть, результат — лучшая из них. Одновременно
+    /// идёт не больше 8 проверок: десятки соединений разом провайдер может
+    /// принять за атаку, и тогда «не отвечают» даже рабочие серверы.
     async fn delays(
         &self,
         base: &str,
@@ -1622,32 +1733,28 @@ impl Engine {
         ids: Vec<String>,
         groups: &HashMap<String, Vec<String>>,
     ) -> HashMap<String, i64> {
-        let mut out = HashMap::new();
-        let mut iter = ids.into_iter();
-        loop {
-            // Ограничиваем параллельность, чтобы не душить сеть на больших подписках.
-            let chunk: Vec<_> = iter
-                .by_ref()
-                .take(16)
-                .map(|id| {
-                    let is_group = groups.contains_key(&id);
-                    async move {
-                        let ms = if is_group {
-                            group_delay(&self.http, base, secret, &id)
-                                .await
-                                .and_then(|m| m.into_values().filter(|d| *d > 0).min())
-                                .unwrap_or(0)
-                        } else {
-                            proxy_delay(&self.http, base, secret, &id).await.unwrap_or(0)
-                        };
-                        (id, ms)
-                    }
-                })
-                .collect();
-            if chunk.is_empty() {
-                break;
+        use futures::stream::{self, StreamExt};
+        let jobs: Vec<(String, String)> = ids
+            .iter()
+            .flat_map(|id| match groups.get(id) {
+                Some(members) => members.iter().map(|m| (id.clone(), m.clone())).collect::<Vec<_>>(),
+                None => vec![(id.clone(), id.clone())],
+            })
+            .collect();
+        let results: Vec<(String, i64)> = stream::iter(jobs)
+            .map(|(id, tag)| async move {
+                let ms = proxy_delay(&self.http, base, secret, &tag).await.unwrap_or(0);
+                (id, ms)
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        let mut out: HashMap<String, i64> = ids.into_iter().map(|id| (id, 0)).collect();
+        for (id, ms) in results {
+            let e = out.entry(id).or_insert(0);
+            if ms > 0 && (*e == 0 || ms < *e) {
+                *e = ms;
             }
-            out.extend(join_all(chunk).await);
         }
         out
     }
@@ -1657,6 +1764,15 @@ impl Engine {
         if servers.is_empty() {
             return Ok(HashMap::new());
         }
+        let tc = self.temp_core(servers, false).await?;
+        let ids = servers.iter().map(|s| s.id.clone()).collect();
+        Ok(self.delays(&tc.base, &tc.secret, ids, &tc.groups).await)
+    }
+
+    /// Временное ядро с указанными серверами (без TUN и системного прокси).
+    /// `with_proxy` — открыть локальный прокси с паролем (для загрузки подписки).
+    /// Процессы останавливаются, когда результат выходит из области видимости.
+    async fn temp_core(&self, servers: &[Server], with_proxy: bool) -> Result<TempCore, String> {
         if !self.paths.singbox.exists() {
             return Err("нет ядра sing-box".into());
         }
@@ -1668,20 +1784,23 @@ impl Engine {
             settings.split.app_mode = AppMode::Off;
             let refs: Vec<&Server> = servers.iter().collect();
             let n_xray = if self.paths.xray.exists() { singbox::xray_count(&refs, &settings) } else { 0 };
-            let mut ports = free_ports(1 + n_xray)?;
+            let mut ports = free_ports(2 + n_xray)?;
+            let clash_port = ports.remove(0);
+            let mixed = ports.remove(0);
             let run = Runtime {
-                mixed_port: 0,
-                mixed_auth: false,
-                clash_port: ports.remove(0),
+                mixed_port: if with_proxy { mixed } else { 0 },
+                mixed_auth: with_proxy,
+                clash_port,
                 secret: random_token(),
                 socks_user: random_token()[..10].to_string(),
                 socks_pass: random_token(),
                 xray_ports: ports,
             };
+            let default = if servers.len() > 1 { TAG_AUTO.to_string() } else { servers[0].id.clone() };
             let built = singbox::build(&BuildInput {
                 settings: &settings,
                 servers: refs,
-                default: servers[0].id.clone(),
+                default,
                 ruleset_dir: Some(&self.paths.ruleset_dir),
                 xray_process: self.paths.xray.exists().then_some(XRAY_EXE),
                 mode: Mode::Proxy,
@@ -1690,6 +1809,22 @@ impl Engine {
             })?;
             (built, run)
         };
+        let mut built = built;
+        if !with_proxy {
+            // Для проверки пинга автовыбор не нужен: группы без своих проверок,
+            // чтобы не удваивать число соединений.
+            if let Some(obs) = built.singbox["outbounds"].as_array_mut() {
+                for o in obs.iter_mut().filter(|o| o["type"] == "urltest") {
+                    let first = o["outbounds"][0].clone();
+                    let m = o.as_object_mut().unwrap();
+                    m.insert("type".into(), serde_json::json!("selector"));
+                    for k in ["url", "interval", "tolerance"] {
+                        m.remove(k);
+                    }
+                    m.insert("default".into(), first);
+                }
+            }
+        }
         let dir = self.paths.data.join("probe").join(&random_token()[..8]);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut guard = Probe { children: vec![], dir: dir.clone() };
@@ -1728,8 +1863,10 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let ids = servers.iter().map(|s| s.id.clone()).collect();
-        Ok(self.delays(&base, &run.secret, ids, &built.groups).await)
+        let proxy = with_proxy.then(|| {
+            format!("http://{}:{}@127.0.0.1:{}", run.socks_user, run.socks_pass, run.mixed_port)
+        });
+        Ok(TempCore { _guard: guard, base, secret: run.secret, proxy, groups: built.groups })
     }
 
     /// Полный выход из приложения: всё останавливается, интернет разблокируется.
@@ -1780,6 +1917,15 @@ async fn group_delay(http: &reqwest::Client, base: &str, secret: &str, tag: &str
     }
     let v: HashMap<String, serde_json::Value> = r.json().await.ok()?;
     Some(v.into_iter().map(|(k, d)| (k, d.as_i64().unwrap_or(0))).collect())
+}
+
+/// Временное ядро: адрес Clash API, ключ, локальный прокси и группы серверов.
+struct TempCore {
+    _guard: Probe,
+    base: String,
+    secret: String,
+    proxy: Option<String>,
+    groups: HashMap<String, Vec<String>>,
 }
 
 /// Процессы временной проверки серверов: останавливаются в любом случае.

@@ -212,30 +212,33 @@ fn servers_from_singbox_json(v: &Value, seed: &str) -> Vec<Server> {
     out
 }
 
-/// Скачивает подписку. `via_proxy` — запасной путь через локальный прокси
-/// (если прямой доступ к панели заблокирован, а VPN уже подключён).
+/// Скачивает подписку. `via_proxy` — путь через локальный прокси ядра
+/// (`http://логин:пароль@127.0.0.1:порт`), если прямой доступ к панели закрыт.
+///
+/// Без прокси сначала пробуем обычный DNS, а если не вышло — узнаём адрес
+/// через DNS-over-HTTPS: провайдеры часто подменяют DNS-ответы для сайтов VPN.
 pub async fn fetch(
     url: &str,
     user_agent: &str,
     seed: &str,
     via_proxy: Option<&str>,
 ) -> Result<Fetched, String> {
-    let mut builder = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(Duration::from_secs(25))
-        .connect_timeout(Duration::from_secs(10));
-    if let Some(p) = via_proxy {
-        builder = builder.proxy(reqwest::Proxy::all(p).map_err(|e| e.to_string())?);
-    } else {
-        builder = builder.no_proxy();
-    }
-    let client = builder.build().map_err(|e| e.to_string())?;
-    let resp = client
-        .get(url)
-        .header("Accept", "*/*")
-        .send()
-        .await
-        .map_err(|e| format!("не удалось загрузить подписку: {e}"))?;
+    let resp = match send(url, user_agent, via_proxy, None).await {
+        Ok(r) => r,
+        Err(first) if via_proxy.is_none() => {
+            let mut got = None;
+            if let Some((host, port)) = host_port(url) {
+                for ip in doh_resolve(&host).await.into_iter().take(3) {
+                    if let Ok(r) = send(url, user_agent, None, Some((&host, std::net::SocketAddr::new(ip, port)))).await {
+                        got = Some(r);
+                        break;
+                    }
+                }
+            }
+            got.ok_or_else(|| format!("не удалось загрузить подписку: {first}"))?
+        }
+        Err(e) => return Err(format!("не удалось загрузить подписку: {e}")),
+    };
     if !resp.status().is_success() {
         return Err(format!("сервер подписки ответил {}", resp.status()));
     }
@@ -264,6 +267,98 @@ pub async fn fetch(
         return Err("в подписке не найдено ни одного сервера".into());
     }
     Ok(f)
+}
+
+async fn send(
+    url: &str,
+    user_agent: &str,
+    via_proxy: Option<&str>,
+    pin: Option<(&str, std::net::SocketAddr)>,
+) -> Result<reqwest::Response, String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(25))
+        .connect_timeout(Duration::from_secs(10));
+    builder = match via_proxy {
+        Some(p) => builder.proxy(reqwest::Proxy::all(p).map_err(|e| e.to_string())?),
+        None => builder.no_proxy(),
+    };
+    if let Some((host, addr)) = pin {
+        builder = builder.resolve(host, addr);
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    client
+        .get(url)
+        .header("Accept", "*/*")
+        .send()
+        .await
+        .map_err(|e| error_chain(&e))
+}
+
+/// Полная причина ошибки: reqwest сам пишет только «error sending request».
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        let t = s.to_string();
+        if !parts.iter().any(|p| p.contains(&t)) {
+            parts.push(t);
+        }
+        cur = s.source();
+    }
+    // Адрес подписки (с ключом) в тексте ошибки не нужен.
+    parts
+        .into_iter()
+        .map(|p| match p.find(" for url (") {
+            Some(i) => p[..i].to_string(),
+            None => p,
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+fn host_port(url: &str) -> Option<(String, u16)> {
+    let u = reqwest::Url::parse(url).ok()?;
+    let host = u.host_str()?.to_string();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some((host, u.port_or_known_default()?))
+}
+
+/// IPv4-адреса домена через DNS-over-HTTPS (Cloudflare, Google) — по IP, без
+/// обычного DNS.
+async fn doh_resolve(host: &str) -> Vec<std::net::IpAddr> {
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(6))
+        .build()
+    else {
+        return vec![];
+    };
+    let endpoints = [
+        format!("https://1.1.1.1/dns-query?name={host}&type=A"),
+        format!("https://8.8.8.8/resolve?name={host}&type=A"),
+        format!("https://1.0.0.1/dns-query?name={host}&type=A"),
+    ];
+    for url in endpoints {
+        let Ok(r) = client.get(&url).header("Accept", "application/dns-json").send().await else {
+            continue;
+        };
+        let Ok(text) = r.text().await else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+        let ips: Vec<std::net::IpAddr> = v["Answer"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|a| a["type"].as_u64() == Some(1))
+            .filter_map(|a| a["data"].as_str()?.parse().ok())
+            .collect();
+        if !ips.is_empty() {
+            return ips;
+        }
+    }
+    vec![]
 }
 
 #[cfg(test)]

@@ -600,7 +600,6 @@ pub fn build_config(
     let mut outbounds = vec![];
     let mut rules = vec![];
     let mut dns_hosts = Map::new();
-    let mut dns_servers: Vec<Value> = vec![];
     for e in entries {
         let in_tag = format!("in-{}", e.tag);
         inbounds.push(json!({
@@ -627,16 +626,12 @@ pub fn build_config(
         // Балансировщик провайдера раскладывается на серверы заранее (см. expand),
         // здесь он мог остаться, только если в нём не нашлось ни одного сервера.
         let part = expand(e.outbound).into_iter().next().unwrap_or_else(|| e.outbound.clone());
-        if let Some(d) = part.get("dns") {
-            if let Some(h) = d["hosts"].as_object() {
-                for (k, v) in h {
-                    dns_hosts.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-            }
-            for sv in d["servers"].as_array().into_iter().flatten() {
-                if !dns_servers.contains(sv) {
-                    dns_servers.push(sv.clone());
-                }
+        // Из DNS подписки берём только закреплённые адреса (hosts). Её DNS-серверы
+        // рассчитаны на работу через туннель, а здесь нужно узнать адрес самого
+        // сервера — напрямую: Cloudflare и другие DoH из России часто недоступны.
+        if let Some(h) = part.get("dns").and_then(|d| d["hosts"].as_object()) {
+            for (k, v) in h {
+                dns_hosts.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
         // Теги получают префикс сервера, ссылки между ними переписываются.
@@ -669,11 +664,6 @@ pub fn build_config(
     // Прямой выход нужен только самому Xray — чтобы узнавать адреса серверов.
     outbounds.insert(1, json!({"protocol": "freedom", "tag": "direct"}));
     rules.insert(0, json!({"type": "field", "inboundTag": ["xray-dns"], "outboundTag": "direct"}));
-    // Сначала DNS из подписки, затем наш прямой DNS как запасной.
-    let fallback = json!(dns);
-    if !dns_servers.contains(&fallback) {
-        dns_servers.push(fallback);
-    }
     let level = match log_level {
         "debug" => "debug",
         "error" => "error",
@@ -685,7 +675,7 @@ pub fn build_config(
         "dns": {
             "tag": "xray-dns",
             "hosts": dns_hosts,
-            "servers": dns_servers,
+            "servers": [dns],
             "queryStrategy": if ipv6 { "UseIP" } else { "UseIPv4" }
         },
         "inbounds": inbounds,
@@ -726,7 +716,31 @@ pub fn expand(v: &Value) -> Vec<Value> {
             members.push(tag_of(first));
         }
     }
-    members.iter().map(|m| sub_bundle(v, &list, m)).collect()
+    // Одинаковые серверы под разными именами (например, запасной совпадает с
+    // основным) проверять и запускать дважды незачем.
+    let mut out: Vec<Value> = vec![];
+    let mut seen: Vec<Value> = vec![];
+    for m in &members {
+        let b = sub_bundle(v, &list, m);
+        let key: Vec<Value> = b["outbounds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| {
+                let mut o = o.clone();
+                if let Some(x) = o.as_object_mut() {
+                    x.remove("tag");
+                }
+                o
+            })
+            .collect();
+        let key = Value::Array(key);
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(b);
+        }
+    }
+    out
 }
 
 /// Связка из одного сервера и того, через что он подключается.
@@ -921,7 +935,8 @@ mod tests {
         assert_eq!(x["outbounds"][1]["tag"], "direct");
         assert_eq!(x["dns"]["hosts"]["nl.example.com"], "5.6.7.8");
         assert!(x["dns"]["hosts"].get("geosite:category-ads-all").is_none());
-        assert_eq!(x["dns"]["servers"], json!(["https://1.1.1.1/dns-query", "77.88.8.8"]));
+        // DNS-серверы подписки не используются для адресов серверов.
+        assert_eq!(x["dns"]["servers"], json!(["77.88.8.8"]));
         assert_eq!(x["routing"]["rules"][0]["inboundTag"][0], "xray-dns");
     }
 }
