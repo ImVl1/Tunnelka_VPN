@@ -21,6 +21,10 @@ pub const RULESET_GEOIP_RU_ANDROID: &str = "libgeoipru.so";
 
 /// Домены верхнего уровня, которые считаются «российскими» даже без набора правил.
 const RU_SUFFIXES: &[&str] = &[".ru", ".su", ".xn--p1ai", ".moscow", ".xn--80adxhks", ".tatar"];
+/// Зарубежные сервисы на доменах .ru: всегда через VPN. Например, через
+/// accounts.google.ru Google проверяет вход — увидев там российский IP, он
+/// считает, что пользователь в России (Gemini и другие сервисы недоступны).
+const FOREIGN_RU: &[&str] = &["google.ru", "youtube.ru", "googleusercontent.ru", "blogspot.ru"];
 
 pub struct BuildInput<'a> {
     pub settings: &'a Settings,
@@ -478,6 +482,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         dns_rules.push(Value::Object(r));
     }
     if split.ru_direct && !include_mode {
+        dns_rules.push(json!({"domain_suffix": FOREIGN_RU, "server": "dns-remote"}));
         dns_rules.push(json!({"domain_suffix": RU_SUFFIXES, "server": "dns-direct"}));
         if geosite_ru {
             dns_rules.push(json!({"rule_set": ["geosite-ru"], "server": "dns-direct"}));
@@ -554,6 +559,13 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         rules.push(Value::Object(r));
     }
     if app_split {
+        if include_mode {
+            let mut q = apps.clone();
+            q.insert("network".into(), json!("udp"));
+            q.insert("port".into(), json!(443));
+            q.insert("action".into(), json!("reject"));
+            rules.push(Value::Object(q));
+        }
         let mut r = apps.clone();
         r.insert(
             "outbound".into(),
@@ -562,6 +574,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         rules.push(Value::Object(r));
     }
     if split.ru_direct && !include_mode {
+        rules.push(json!({"domain_suffix": FOREIGN_RU, "outbound": TAG_PROXY}));
         rules.push(json!({"domain_suffix": RU_SUFFIXES, "outbound": TAG_DIRECT}));
         let mut sets = vec![];
         if geosite_ru {
@@ -573,6 +586,13 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         if !sets.is_empty() {
             rules.push(json!({"rule_set": sets, "outbound": TAG_DIRECT}));
         }
+    }
+
+    // QUIC (UDP 443) через VPN не пускаем: многие серверы (VLESS с XTLS Vision)
+    // его отвергают, и браузер долго ждёт, прежде чем перейти на обычный HTTPS.
+    // Отказ сразу — и сайт открывается через TCP. Так же делает конфиг провайдера.
+    if !include_mode {
+        rules.push(json!({"network": "udp", "port": 443, "action": "reject"}));
     }
 
     let mut route = json!({

@@ -612,7 +612,11 @@ pub fn build_config(
                 "accounts": [{"user": auth.0, "pass": auth.1}],
                 "udp": true,
                 "ip": "127.0.0.1"
-            }
+            },
+            // Как в конфигах провайдеров: серверу передаётся имя сайта, а не IP.
+            // Адрес сайта тогда находит сам сервер — в своей стране, и сервисы
+            // вроде Google не получают адрес, найденный в России.
+            "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": false}
         }));
         if !is_bundle(e.outbound) {
             let out_tag = format!("out-{}", e.tag);

@@ -1704,22 +1704,89 @@ impl Engine {
             Self::live(&rt) && !rt.paused && rt.active_sub.as_deref() == Some(sub_id)
         };
         let ids: Vec<String> = servers.iter().map(|s| s.id.clone()).collect();
-        if live {
+        let detail = if live {
             let (base, secret) = self.clash_base();
             let groups = self.rt.lock().unwrap().groups.clone();
-            return self.delays(&base, &secret, ids, &groups).await;
-        }
-        match self.probe(&servers).await {
-            Ok(m) => m,
-            Err(e) => {
-                self.log(format!("[app] проверка через ядро не удалась ({e}), TCP-пинг"));
-                let tasks = servers.into_iter().map(|s| async move {
-                    let ms = if s.is_udp() { -1 } else { tcp_ping(&s.address, s.port).await.unwrap_or(0) };
-                    (s.id, ms)
-                });
-                join_all(tasks).await.into_iter().collect()
+            self.delays(&base, &secret, ids, &groups).await
+        } else {
+            match self.probe(&servers).await {
+                Ok(m) => m,
+                Err(e) => {
+                    self.log(format!("[app] проверка через ядро не удалась ({e}), TCP-пинг"));
+                    let tasks = servers.into_iter().map(|s| async move {
+                        let ms = if s.is_udp() { -1 } else { tcp_ping(&s.address, s.port).await.unwrap_or(0) };
+                        (s.id, ms)
+                    });
+                    return join_all(tasks).await.into_iter().collect();
+                }
             }
-        }
+        };
+        self.display_pings(&servers, detail).await
+    }
+
+    /// Для списка: у рабочих серверов — пинг до самого сервера (время одного
+    /// TCP-соединения, как в других клиентах). Проверка через сервер длиннее:
+    /// это соединение, REALITY/TLS, TLS с сайтом и ответ — 3–4 обмена.
+    /// Если пинг измерить нельзя (UDP-протоколы, чужой TUN), остаётся проверка.
+    async fn display_pings(
+        &self,
+        servers: &[Server],
+        detail: HashMap<String, (i64, Option<String>)>,
+    ) -> HashMap<String, i64> {
+        use futures::stream::{self, StreamExt};
+        let bypass_tun = PLATFORM == Platform::Windows && {
+            let rt = self.rt.lock().unwrap();
+            Self::live(&rt) && !rt.paused && rt.mode == Mode::Tun
+        };
+        let jobs: Vec<(String, String, u16)> = servers
+            .iter()
+            .filter_map(|s| {
+                let (ms, best) = detail.get(&s.id)?.clone();
+                if ms <= 0 {
+                    return None;
+                }
+                let (host, port, proto) = endpoint_of(s, best.as_deref());
+                if host.is_empty() || matches!(proto.as_str(), "hysteria" | "hysteria2" | "tuic") {
+                    return None;
+                }
+                Some((s.id.clone(), host, port))
+            })
+            .collect();
+        let rtts: HashMap<String, i64> = stream::iter(jobs)
+            .map(|(id, host, port)| async move {
+                let addr = tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .ok()
+                    .and_then(|mut it| {
+                        let all: Vec<std::net::SocketAddr> = it.by_ref().collect();
+                        all.iter().find(|a| a.is_ipv4()).or(all.first()).copied()
+                    });
+                let ms = match addr {
+                    Some(a) => tauri::async_runtime::spawn_blocking(move || {
+                        crate::netbind::connect_ms(a, bypass_tun, Duration::from_secs(2))
+                    })
+                    .await
+                    .ok()
+                    .flatten(),
+                    None => None,
+                };
+                (id, ms.unwrap_or(0))
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+        detail
+            .into_iter()
+            .map(|(id, (ms, _))| {
+                // Меньше 3 мс до зарубежного сервера не бывает — значит, соединение
+                // перехватил чужой VPN; показываем проверку через сервер.
+                let shown = match rtts.get(&id) {
+                    Some(r) if *r >= 3 && ms > 0 => *r,
+                    _ => ms,
+                };
+                (id, shown)
+            })
+            .collect()
     }
 
     /// URL-тест каждого сервера через Clash API ядра. У сервера с автовыбором
@@ -1732,7 +1799,7 @@ impl Engine {
         secret: &str,
         ids: Vec<String>,
         groups: &HashMap<String, Vec<String>>,
-    ) -> HashMap<String, i64> {
+    ) -> HashMap<String, (i64, Option<String>)> {
         use futures::stream::{self, StreamExt};
         let jobs: Vec<(String, String)> = ids
             .iter()
@@ -1741,26 +1808,26 @@ impl Engine {
                 None => vec![(id.clone(), id.clone())],
             })
             .collect();
-        let results: Vec<(String, i64)> = stream::iter(jobs)
+        let results: Vec<(String, String, i64)> = stream::iter(jobs)
             .map(|(id, tag)| async move {
                 let ms = proxy_delay(&self.http, base, secret, &tag).await.unwrap_or(0);
-                (id, ms)
+                (id, tag, ms)
             })
             .buffer_unordered(8)
             .collect()
             .await;
-        let mut out: HashMap<String, i64> = ids.into_iter().map(|id| (id, 0)).collect();
-        for (id, ms) in results {
-            let e = out.entry(id).or_insert(0);
-            if ms > 0 && (*e == 0 || ms < *e) {
-                *e = ms;
+        let mut out: HashMap<String, (i64, Option<String>)> = ids.into_iter().map(|id| (id, (0, None))).collect();
+        for (id, tag, ms) in results {
+            let e = out.entry(id).or_insert((0, None));
+            if ms > 0 && (e.0 == 0 || ms < e.0) {
+                *e = (ms, Some(tag));
             }
         }
         out
     }
 
     /// Временно запускает ядра без входящих подключений и проверяет серверы.
-    async fn probe(&self, servers: &[Server]) -> Result<HashMap<String, i64>, String> {
+    async fn probe(&self, servers: &[Server]) -> Result<HashMap<String, (i64, Option<String>)>, String> {
         if servers.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1892,6 +1959,22 @@ pub fn find_selection<'a>(
                 .find(|s| s.id == id)
                 .map(|srv| (sub, Some(srv)))
         }),
+    }
+}
+
+/// Адрес, порт и протокол сервера; для сервера с автовыбором — выбранной части.
+fn endpoint_of(s: &Server, best: Option<&str>) -> (String, u16, String) {
+    let part = best
+        .and_then(|t| t.rsplit_once('~'))
+        .and_then(|(_, i)| i.parse::<usize>().ok())
+        .and_then(|i| s.xray.as_ref().map(|x| tunnelka_core::xray::expand(x)).and_then(|p| p.into_iter().nth(i)));
+    match part {
+        Some(p) => {
+            let m = tunnelka_core::xray::primary(&p);
+            let (a, port) = tunnelka_core::xray::outbound_endpoint(m);
+            (a, port, m["protocol"].as_str().unwrap_or("").to_string())
+        }
+        None => (s.address.clone(), s.port, s.protocol.clone()),
     }
 }
 

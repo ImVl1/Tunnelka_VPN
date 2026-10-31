@@ -3,6 +3,7 @@
 mod autostart;
 mod engine;
 mod killswitch;
+mod netbind;
 mod procs;
 mod sysproxy;
 
