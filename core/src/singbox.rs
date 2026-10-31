@@ -554,6 +554,13 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         "secret": rt.secret
     });
 
+    let mut experimental = json!({"clash_api": clash});
+    if android {
+        // Android: VPN может перезапуститься без приложения (плитка в шторке,
+        // постоянный VPN), поэтому выбранный сервер запоминается в кэше ядра.
+        experimental["cache_file"] = json!({"enabled": true, "path": "cache.db"});
+    }
+
     let xray_cfg = xray_used.then(|| {
         let entries: Vec<XrayEntry> = xray_entries
             .iter()
@@ -574,7 +581,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": route,
-        "experimental": {"clash_api": clash}
+        "experimental": experimental
     });
     Ok(Built { singbox, xray: xray_cfg })
 }

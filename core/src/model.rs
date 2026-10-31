@@ -230,6 +230,9 @@ pub struct Settings {
     /// Блокировать интернет, если VPN неожиданно отключился.
     #[serde(default)]
     pub kill_switch: bool,
+    /// Android: показывать уведомление о работе VPN в шторке.
+    #[serde(default = "yes")]
+    pub notification: bool,
     #[serde(default = "user_agent")]
     pub user_agent: String,
     #[serde(default)]
@@ -263,8 +266,8 @@ impl Default for Settings {
 }
 
 /// Параметры одного запуска ядра: случайные порты и пароли, которые
-/// не хранятся на диске и меняются при каждом подключении.
-#[derive(Debug, Clone, Default)]
+/// меняются при каждом подключении.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Runtime {
     /// Локальный прокси (0 — не нужен).
     pub mixed_port: u16,

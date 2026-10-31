@@ -122,6 +122,28 @@ async fn open_vpn_settings() -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Android: ограничивает ли система работу в фоне.
+#[tauri::command]
+async fn battery_status() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(|| tauri_plugin_tunnelka_vpn::battery().unrestricted)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_battery_settings() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(tauri_plugin_tunnelka_vpn::open_battery_settings)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn open_notification_settings() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(tauri_plugin_tunnelka_vpn::open_notification_settings)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("tg://")) {
@@ -251,7 +273,7 @@ pub fn run() {
                 }
             }
 
-            // Автоподключение + автообновление подписок.
+            // Автоподключение.
             let e2 = engine.clone();
             tauri::async_runtime::spawn(async move {
                 if e2.settings().auto_connect {
@@ -260,14 +282,22 @@ pub fn run() {
                     if cfg!(target_os = "android") {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
-                    if let Err(err) = e2.connect().await {
-                        e2.log(format!("[app] автоподключение: {err}"));
+                    // VPN мог уже работать (включён из шторки) — не перезапускаем.
+                    if !e2.is_running() {
+                        if let Err(err) = e2.connect().await {
+                            e2.log(format!("[app] автоподключение: {err}"));
+                        }
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+            // Автообновление подписок: после запуска и далее раз в час проверяем,
+            // но каждую подписку обновляем не чаще раза в сутки.
+            let e3 = engine.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
                 loop {
-                    e2.update_due().await;
-                    tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+                    e3.update_due().await;
+                    tokio::time::sleep(Duration::from_secs(60 * 60)).await;
                 }
             });
             Ok(())
@@ -300,6 +330,9 @@ pub fn run() {
             clear_logs,
             list_apps,
             open_vpn_settings,
+            battery_status,
+            open_battery_settings,
+            open_notification_settings,
             open_url
         ])
         .build(tauri::generate_context!())

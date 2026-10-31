@@ -5,56 +5,57 @@
 <h1 align="center">Tunnelka</h1>
 
 <p align="center">
-  VPN-клиент для подписок VLESS, VMess, Trojan, Shadowsocks, Hysteria2 и TUIC.<br />
-  Windows и Android.
+  A VPN client for VLESS, VMess, Trojan, Shadowsocks, Hysteria2 and TUIC subscriptions.<br />
+  Windows and Android.
 </p>
 
 <p align="center">
-  <a href="https://imvl1.github.io/Tunnelka_VPN/"><b>Скачать</b></a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/ImVl1/Tunnelka_VPN/releases/latest">Последняя версия</a>
+  <a href="https://imvl1.github.io/Tunnelka_VPN/"><b>Download</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/ImVl1/Tunnelka_VPN/releases/latest">Latest release</a>
+  &nbsp;·&nbsp;
+  <a href="README.ru.md">Читать на русском</a>
 </p>
 
 <p align="center">
-  <img src="assets/screenshots/windows-servers.png" width="640" alt="Tunnelka для Windows" />
+  <img src="assets/screenshots/windows-servers.png" width="640" alt="Tunnelka for Windows" />
   &nbsp;
-  <img src="assets/screenshots/android-home.png" width="200" alt="Tunnelka для Android" />
+  <img src="assets/screenshots/android-home.png" width="200" alt="Tunnelka for Android" />
 </p>
 
-## Возможности
+## Features
 
-**Подписки.** Вставьте ссылку из бота или личного кабинета — Marzban, Remnawave, 3x-ui, Hiddify и другие панели. Tunnelka покажет остаток трафика и срок подписки, объявления провайдера и будет сама обновлять список серверов. Поддерживаются списки ссылок (обычные и в base64), JSON-конфиги sing-box и Xray. Отдельные серверы можно добавить ссылками.
+**Subscriptions.** Paste the link from your provider's bot or dashboard: Marzban, Remnawave, 3x-ui, Hiddify and other panels work out of the box. Tunnelka shows remaining traffic, the expiry date and provider announcements, and refreshes subscriptions automatically once a day after launch. Plain and base64 link lists and sing-box / Xray JSON configs are supported. Individual servers can be added as links.
 
-**Протоколы.** VLESS (REALITY, TLS, XTLS Vision, XHTTP, WebSocket, gRPC, HTTPUpgrade), VMess, Trojan, Shadowsocks и Shadowsocks 2022, Hysteria2 с port hopping, TUIC, SOCKS5 и HTTP(S).
+**Protocols.** VLESS (REALITY, TLS, XTLS Vision, XHTTP, WebSocket, gRPC, HTTPUpgrade), VMess, Trojan, Shadowsocks and Shadowsocks 2022, Hysteria2 with port hopping, TUIC, SOCKS5 and HTTP(S).
 
-**Раздельное туннелирование.**
-- По приложениям: «всё через VPN, кроме выбранных» или «только выбранные через VPN». У каждого режима свой список.
-- По сайтам: списки «через VPN» и «напрямую» — домены, IP-адреса и подсети.
-- Российские сайты и IP-адреса можно пустить напрямую одной галочкой.
+**Split tunneling.**
+- By app: "everything through the VPN except selected apps" or "only selected apps through the VPN". Each mode keeps its own list.
+- By site: "through the VPN" and "direct" lists of domains, IP addresses and subnets.
+- Russian sites and IP addresses can be sent direct with a single switch.
 
-**Подключение.**
-- Автовыбор сервера с наименьшей задержкой и переключение серверов без разрыва соединения.
-- Если выбранный сервер не отвечает, Tunnelka переключится на рабочий.
-- Windows: режим TUN (весь трафик компьютера) или системный прокси. Если у провайдера TUN не даёт интернета, приложение само перейдёт на системный прокси.
-- Android: системный VPN, работает для всех приложений.
+**Connection.**
+- Automatic selection of the lowest-latency server and switching between servers without dropping the connection.
+- If the selected server stops answering, Tunnelka moves to a working one.
+- Windows: TUN mode (all traffic on the computer) or system proxy. If your ISP breaks TUN, the app falls back to the system proxy on its own.
+- Android: system VPN for all apps, a Quick Settings tile, Pause and Disconnect buttons in the notification, and Always-on VPN support. The VPN keeps running after the app is swiped away from recents.
 
-**Безопасность.**
-- Kill switch (Windows): если VPN неожиданно отключился, брандмауэр не выпустит программы в интернет напрямую. На Android — через системные «Постоянная VPN» и «Блокировать соединения без VPN».
-- DNS-запросы и IPv6 не уходят мимо туннеля.
-- Локальные порты выбираются случайно при каждом подключении и закрыты случайным паролем, поэтому другие программы не могут найти прокси и воспользоваться им.
-- Файлы с паролями серверов удаляются сразу после запуска ядра.
+**Security.**
+- Kill switch (Windows): if the VPN drops unexpectedly, the firewall keeps programs from reaching the internet directly. On Android, use the system "Always-on VPN" and "Block connections without VPN" settings.
+- DNS queries and IPv6 never bypass the tunnel.
+- Local ports are randomized on every connection and protected by a random password, so other programs can't discover or use the proxy.
 
-**Удобство.** Значок в трее, запуск вместе с Windows и подключение при запуске (по умолчанию выключены), раздача VPN в локальную сеть с паролем, журнал работы.
+**Convenience.** Tray icon, start with Windows and connect on launch (both off by default), sharing the VPN with the local network behind a password, and a log viewer.
 
-## Системные требования
+## System requirements
 
-- Windows 10 или 11, 64 бит. Для режима TUN приложение запрашивает права администратора.
-- Android 7.0 и новее, процессор arm64 (практически все современные телефоны).
+- Windows 10 or 11, 64-bit. TUN mode requires administrator rights.
+- Android 7.0 or newer on an arm64 processor (almost every modern phone).
 
-## Как устроено
+## How it works
 
-Интерфейс и логика написаны на Rust и [Tauri](https://tauri.app) и общие для обеих платформ. Подключения обслуживает [sing-box](https://github.com/SagerNet/sing-box); серверы, которые sing-box не поддерживает (XHTTP, VLESS Encryption), автоматически запускаются через [Xray-core](https://github.com/XTLS/Xray-core). На Android туннель создаёт системный VpnService вместе с [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel).
+The interface and logic are written in Rust with [Tauri](https://tauri.app) and shared between both platforms. Connections are handled by [sing-box](https://github.com/SagerNet/sing-box); servers that sing-box doesn't support (XHTTP, VLESS Encryption) are run through [Xray-core](https://github.com/XTLS/Xray-core) automatically. On Android the tunnel is created by the system VpnService together with [hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel).
 
-## Лицензии
+## License
 
-Код Tunnelka распространяется по лицензии MIT. Ядра поставляются в составе приложения под собственными лицензиями: sing-box — GPL-3.0, Xray-core — MPL-2.0, hev-socks5-tunnel — MIT.
+Tunnelka is released under the MIT license. The bundled cores keep their own licenses: sing-box — GPL-3.0, Xray-core — MPL-2.0, hev-socks5-tunnel — MIT. The Inter font is licensed under the SIL Open Font License 1.1.

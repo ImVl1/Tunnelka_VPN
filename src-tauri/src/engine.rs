@@ -73,6 +73,12 @@ struct Rt {
     /// Сообщение для пользователя (например, о переходе на системный прокси).
     notice: Option<String>,
     busy: bool,
+    /// Android: VPN на паузе (из уведомления).
+    paused: bool,
+    /// Идёт фоновая проверка интернета после подключения.
+    checking: bool,
+    /// Номер подключения: фоновая проверка не трогает более новое подключение.
+    gen: u64,
     /// Режим, в котором реально работает подключение.
     mode: Mode,
     run: Runtime,
@@ -97,6 +103,10 @@ pub struct Status {
     pub mixed_port: u16,
     /// Kill switch сейчас блокирует интернет.
     pub kill_switch_active: bool,
+    /// Android: VPN на паузе.
+    pub paused: bool,
+    /// Идёт проверка, что через VPN есть интернет.
+    pub checking: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +118,8 @@ pub struct Traffic {
 
 pub struct Paths {
     pub data: PathBuf,
+    /// Android: папка профиля VPN-сервиса (конфиги ядер, журнал, кэш).
+    pub vpn_dir: PathBuf,
     pub state: PathBuf,
     pub config: PathBuf,
     pub singbox: PathBuf,
@@ -178,10 +190,25 @@ impl Paths {
         } else {
             core_dir.clone()
         };
+        // На Android конфиги остаются в закрытой папке приложения: по ним
+        // VPN-сервис перезапускает ядра сам (плитка, «Постоянная VPN»).
+        let vpn_dir = data.join("vpn");
+        let cfg_dir = if android_core {
+            let _ = std::fs::create_dir_all(&vpn_dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&vpn_dir, std::fs::Permissions::from_mode(0o700));
+            }
+            vpn_dir.clone()
+        } else {
+            data.clone()
+        };
         Paths {
             state: data.join("state.json"),
-            config: data.join("config.json"),
-            xray_config: data.join("xray.json"),
+            config: cfg_dir.join("config.json"),
+            xray_config: cfg_dir.join("xray.json"),
+            vpn_dir,
             singbox: core_dir.join(SINGBOX_EXE),
             xray: core_dir.join(XRAY_EXE),
             ruleset_dir,
@@ -198,11 +225,33 @@ pub struct Engine {
     http: reqwest::Client,
 }
 
-/// Чем закончилась попытка подключения.
-enum Outcome {
-    Ok,
-    /// В режиме TUN нет интернета, а сервер работает — нужен системный прокси.
-    TunBroken,
+/// Профиль для VPN-сервиса Android: по нему сервис сам запускает ядра.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VpnProfile {
+    session: String,
+    /// Название сервера для уведомления.
+    server: String,
+    notify: bool,
+    socks_port: u16,
+    socks_user: String,
+    socks_pass: String,
+    app_mode: String,
+    apps: Vec<String>,
+    work_dir: String,
+    log: String,
+    env: HashMap<String, String>,
+    processes: Vec<ProcSpec>,
+    /// Для приложения: порты и ключи Clash API, если VPN включили без него.
+    runtime: Runtime,
+    active_sub: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProcSpec {
+    name: String,
+    exe: String,
+    args: Vec<String>,
 }
 
 impl Engine {
@@ -230,11 +279,14 @@ impl Engine {
             http,
         });
         engine.save();
-        crate::procs::kill_orphans(&engine.paths.singbox);
-        crate::procs::kill_orphans(&engine.paths.xray);
-        // Остатки конфигов с паролями от прошлого запуска.
-        let _ = std::fs::remove_file(&engine.paths.config);
-        let _ = std::fs::remove_file(&engine.paths.xray_config);
+        // На Android ядрами управляет VPN-сервис, он может работать и без окна.
+        if PLATFORM != Platform::Android {
+            crate::procs::kill_orphans(&engine.paths.singbox);
+            crate::procs::kill_orphans(&engine.paths.xray);
+            // Остатки конфигов с паролями от прошлого запуска.
+            let _ = std::fs::remove_file(&engine.paths.config);
+            let _ = std::fs::remove_file(&engine.paths.xray_config);
+        }
         // Kill switch остался включённым после сбоя приложения. Если подключение
         // при запуске выключено, возвращаем интернет, иначе ждём подключения.
         if killswitch::is_active(&engine.paths.data) && !auto_connect {
@@ -251,11 +303,33 @@ impl Engine {
     }
 
     pub fn logs(&self) -> Vec<String> {
-        self.logs.lock().unwrap().iter().cloned().collect()
+        let mut out: Vec<String> = self.logs.lock().unwrap().iter().cloned().collect();
+        if PLATFORM == Platform::Android {
+            // Ядра на Android запускает VPN-сервис и пишет их вывод в файл.
+            if let Ok(text) = std::fs::read_to_string(self.core_log()) {
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let from = lines.len().saturating_sub(MAX_LOG_LINES / 2);
+                out.extend(lines[from..].iter().map(|l| l.to_string()));
+            }
+        }
+        out
     }
 
     pub fn clear_logs(&self) {
         self.logs.lock().unwrap().clear();
+        if PLATFORM == Platform::Android {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(self.core_log()) {
+                let _ = f.set_len(0);
+            }
+        }
+    }
+
+    fn core_log(&self) -> PathBuf {
+        self.paths.vpn_dir.join("core.log")
+    }
+
+    fn profile_path(&self) -> PathBuf {
+        self.paths.vpn_dir.join("profile.json")
     }
 
     fn save(&self) {
@@ -451,20 +525,24 @@ impl Engine {
         res.map(|_| ())
     }
 
+    /// Автообновление подписок: при запуске приложения и затем раз в час
+    /// проверяет, но каждую подписку обновляет не чаще раза в сутки.
     pub async fn update_due(&self) {
+        const DAY: u64 = 24 * 3600;
         let due: Vec<String> = {
             let st = self.state.lock().unwrap();
             let t = now();
             st.subscriptions
                 .iter()
-                .filter(|s| s.url.is_some() && s.update_interval_h > 0)
-                .filter(|s| t.saturating_sub(s.updated_at) >= s.update_interval_h as u64 * 3600)
+                .filter(|s| s.url.is_some())
+                .filter(|s| t.saturating_sub(s.updated_at) >= DAY)
                 .map(|s| s.id.clone())
                 .collect()
         };
         for id in due {
-            if let Err(e) = self.update_subscription(&id).await {
-                self.log(format!("[app] автообновление подписки {id}: {e}"));
+            match self.update_subscription(&id).await {
+                Ok(()) => self.log(format!("[app] подписка {id} обновлена автоматически")),
+                Err(e) => self.log(format!("[app] автообновление подписки {id}: {e}")),
             }
         }
     }
@@ -537,25 +615,30 @@ impl Engine {
     // Подключение
     // -----------------------------------------------------------------------
 
+    /// Подключение работает (ядро запущено или VPN Android включён).
+    fn live(rt: &Rt) -> bool {
+        rt.child.is_some() || rt.vpn_on
+    }
+
     pub fn is_running(&self) -> bool {
         let mut rt = self.rt.lock().unwrap();
         self.reap(&mut rt);
-        rt.child.is_some()
+        Self::live(&rt)
     }
 
-    /// Проверяет, не упало ли ядро (или туннель Android).
+    /// Проверяет, не упало ли ядро (на Android — сверяется с VPN-сервисом).
     fn reap(&self, rt: &mut Rt) {
+        if PLATFORM == Platform::Android {
+            self.reap_android(rt);
+            return;
+        }
         let dead = |c: &mut Option<Child>| match c.as_mut() {
             Some(c) => matches!(c.try_wait(), Ok(Some(_))),
             None => false,
         };
         let sb_dead = dead(&mut rt.child);
         let xr_dead = dead(&mut rt.xray);
-        let vpn_dead = PLATFORM == Platform::Android
-            && rt.vpn_on
-            && rt.child.is_some()
-            && !tauri_plugin_tunnelka_vpn::state().running;
-        if !(sb_dead || xr_dead || vpn_dead) {
+        if !(sb_dead || xr_dead) {
             return;
         }
         for c in [rt.child.take(), rt.xray.take()].into_iter().flatten() {
@@ -563,27 +646,18 @@ impl Engine {
             let _ = c.kill();
             let _ = c.wait();
         }
-        if rt.vpn_on {
-            let _ = tauri_plugin_tunnelka_vpn::stop();
-            rt.vpn_on = false;
-        }
         rt.active_sub = None;
+        rt.gen += 1;
         if rt.sysproxy_on {
             let _ = sysproxy::unset();
             rt.sysproxy_on = false;
         }
-        let reason = if vpn_dead {
-            tauri_plugin_tunnelka_vpn::state()
-                .error
-                .unwrap_or_else(|| "VPN отключён системой".into())
-        } else {
-            let tail = self.last_error_line();
-            format!(
-                "ядро {} завершилось{}",
-                if xr_dead { "Xray" } else { "sing-box" },
-                tail.map(|t| format!(": {t}")).unwrap_or_default()
-            )
-        };
+        let tail = self.last_error_line();
+        let reason = format!(
+            "ядро {} завершилось{}",
+            if xr_dead { "Xray" } else { "sing-box" },
+            tail.map(|t| format!(": {t}")).unwrap_or_default()
+        );
         let ks = killswitch::is_active(&self.paths.data);
         rt.last_error = Some(if ks {
             format!("{reason}. Интернет заблокирован kill switch — подключитесь снова или нажмите «Разблокировать интернет»")
@@ -592,8 +666,48 @@ impl Engine {
         });
     }
 
+    /// Android: VPN-сервис живёт сам по себе — его можно включить плиткой в шторке,
+    /// поставить на паузу или отключить из уведомления.
+    fn reap_android(&self, rt: &mut Rt) {
+        if rt.busy {
+            return;
+        }
+        let vs = tauri_plugin_tunnelka_vpn::state();
+        if vs.active() {
+            rt.paused = vs.state == "paused";
+            if !rt.vpn_on {
+                // VPN включили без приложения — берём параметры из профиля.
+                if let Some(p) = self.read_profile() {
+                    rt.vpn_on = true;
+                    rt.run = p.runtime;
+                    rt.active_sub = Some(p.active_sub);
+                    rt.mode = Mode::Tun;
+                    rt.last_error = None;
+                    rt.gen += 1;
+                }
+            }
+            if vs.started_at > 0 {
+                rt.started_at = vs.started_at;
+            }
+        } else if rt.vpn_on {
+            rt.vpn_on = false;
+            rt.paused = false;
+            rt.active_sub = None;
+            rt.started_at = 0;
+            rt.gen += 1;
+            // Без ошибки — значит, VPN отключили кнопкой в уведомлении или плиткой.
+            rt.last_error = vs.error;
+        }
+    }
+
+    fn read_profile(&self) -> Option<VpnProfile> {
+        std::fs::read_to_string(self.profile_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
     fn last_error_line(&self) -> Option<String> {
-        let logs = self.logs.lock().unwrap();
+        let logs = self.logs();
         logs.iter()
             .rev()
             .take(40)
@@ -604,22 +718,24 @@ impl Engine {
             .cloned()
     }
 
+    fn selected_name(st: &Persisted) -> Option<(String, Option<String>)> {
+        st.selected
+            .as_ref()
+            .and_then(|s| find_selection(&st.subscriptions, s))
+            .map(|(sub, srv)| match srv {
+                Some(srv) => (srv.name.clone(), Some(srv.protocol.clone())),
+                None => (format!("Автовыбор · {}", sub.name), None),
+            })
+    }
+
     pub fn status(&self) -> Status {
         let (settings, selected, subs_name) = {
             let st = self.state.lock().unwrap();
-            let sel = st.selected.clone();
-            let name = sel
-                .as_ref()
-                .and_then(|s| find_selection(&st.subscriptions, s))
-                .map(|(sub, srv)| match srv {
-                    Some(srv) => (srv.name.clone(), Some(srv.protocol.clone())),
-                    None => (format!("Автовыбор · {}", sub.name), None),
-                });
-            (st.settings.clone(), sel, name)
+            (st.settings.clone(), st.selected.clone(), Self::selected_name(&st))
         };
         let mut rt = self.rt.lock().unwrap();
         self.reap(&mut rt);
-        let running = rt.child.is_some();
+        let running = Self::live(&rt);
         Status {
             platform: if PLATFORM == Platform::Android { "android" } else { "windows" },
             running,
@@ -634,12 +750,14 @@ impl Engine {
             notice: rt.notice.clone(),
             core_found: self.paths.singbox.exists(),
             xray_found: self.paths.xray.exists(),
-            mixed_port: if running { rt.run.mixed_port } else { 0 },
+            mixed_port: if running && rt.mode == Mode::Proxy { rt.run.mixed_port } else { 0 },
             kill_switch_active: killswitch::is_active(&self.paths.data),
+            paused: running && rt.paused,
+            checking: running && rt.checking,
         }
     }
 
-    pub async fn connect(&self) -> Result<Status, String> {
+    pub async fn connect(self: &Arc<Self>) -> Result<Status, String> {
         {
             let mut rt = self.rt.lock().unwrap();
             if rt.busy {
@@ -647,28 +765,28 @@ impl Engine {
             }
             rt.busy = true;
             rt.notice = None;
+            rt.checking = false;
         }
-        let mode = self.settings().mode;
-        let mut res = self.connect_inner(mode, true).await;
-        if let Ok(Outcome::TunBroken) = res {
-            self.log("[app] в режиме TUN нет интернета — переключаюсь на системный прокси");
-            res = self.connect_inner(Mode::Proxy, false).await;
-            if res.is_ok() {
-                self.rt.lock().unwrap().notice = Some(
-                    "В режиме TUN не было интернета (такое бывает у некоторых провайдеров) — включён системный прокси".into(),
-                );
-            }
-        }
-        let res = res.map(|_| ());
+        let settings = self.settings();
+        let mode = if PLATFORM == Platform::Android { Mode::Tun } else { settings.mode };
+        let res = self.connect_inner(mode).await;
         if res.is_err() {
             self.stop_process();
         }
-        {
+        let gen = {
             let mut rt = self.rt.lock().unwrap();
             rt.busy = false;
             if let Err(e) = &res {
                 rt.last_error = Some(e.clone());
             }
+            rt.gen
+        };
+        // Проверка интернета в режиме TUN идёт в фоне: подключение уже работает,
+        // а если у провайдера TUN не даёт интернета — переключимся на прокси.
+        if res.is_ok() && PLATFORM != Platform::Android && mode == Mode::Tun && settings.tun_fallback {
+            self.rt.lock().unwrap().checking = true;
+            let me = self.clone();
+            tauri::async_runtime::spawn(async move { me.tun_watch(gen).await });
         }
         res.map(|_| self.status())
     }
@@ -700,20 +818,22 @@ impl Engine {
         Ok(child)
     }
 
-    async fn connect_inner(&self, mode: Mode, allow_fallback: bool) -> Result<Outcome, String> {
+    async fn connect_inner(&self, mode: Mode) -> Result<(), String> {
         if !self.paths.singbox.exists() {
             return Err(format!(
                 "не найдено ядро sing-box: {}",
                 self.paths.singbox.display()
             ));
         }
-        // Если уже запущено — перезапускаем с новой конфигурацией.
-        // Kill switch при этом не снимаем, чтобы не было утечки между запусками.
-        self.stop_process();
         let android = PLATFORM == Platform::Android;
-        let mode = if android { Mode::Tun } else { mode };
+        // Если уже запущено — перезапускаем с новой конфигурацией. На Android
+        // VPN-сервис перезапускается сам по команде запуска, без разрыва VPN.
+        // Kill switch при этом не снимаем, чтобы не было утечки между запусками.
+        if !android {
+            self.stop_process();
+        }
 
-        let (config, sub_id, settings, run) = {
+        let (config, sub_id, settings, run, server_name) = {
             let st = self.state.lock().unwrap();
             let sel = st
                 .selected
@@ -774,31 +894,84 @@ impl Engine {
                 platform: PLATFORM,
                 runtime: &run,
             })?;
-            (built, sub.id.clone(), st.settings.clone(), run)
+            let name = Self::selected_name(&st).map(|n| n.0).unwrap_or_default();
+            (built, sub.id.clone(), st.settings.clone(), run, name)
         };
 
-        // Kill switch включаем до запуска ядер, чтобы не было окна для утечки.
-        if !android {
-            if settings.kill_switch {
+        if android {
+            return self.start_android(config, sub_id, settings, run, server_name).await;
+        }
+
+        // Kill switch включается параллельно с запуском ядер (PowerShell долго
+        // стартует), но подключение не считается готовым, пока он не включился.
+        let ks_task = if settings.kill_switch {
+            if killswitch::is_active(&self.paths.data) {
+                None
+            } else {
                 let mut programs = vec![self.paths.singbox.clone(), self.paths.xray.clone()];
                 if let Ok(me) = std::env::current_exe() {
                     programs.push(me);
                 }
-                let tun = [singbox::TUN_ADDR4, singbox::TUN_ADDR6];
-                match killswitch::enable(&self.paths.data, &programs, &tun) {
-                    Ok(off) if !off.is_empty() => self.log(format!(
-                        "[app] брандмауэр Windows выключен для профилей: {} — kill switch там не сработает",
-                        off.join(", ")
-                    )),
-                    Ok(_) => self.log("[app] kill switch включён"),
-                    Err(e) => return Err(format!("kill switch: {e}")),
-                }
-            } else if killswitch::is_active(&self.paths.data) {
+                let data = self.paths.data.clone();
+                Some(tauri::async_runtime::spawn_blocking(move || {
+                    killswitch::enable(&data, &programs, &[singbox::TUN_ADDR4, singbox::TUN_ADDR6])
+                }))
+            }
+        } else {
+            if killswitch::is_active(&self.paths.data) {
                 let _ = killswitch::disable(&self.paths.data);
             }
-        }
+            None
+        };
 
-        // Сначала Xray (если нужен): sing-box будет подключаться к его SOCKS-входам.
+        let started = self.start_cores(&config, mode, &run).await;
+        let started = match started {
+            Ok(()) => match ks_task {
+                Some(t) => match t.await.map_err(|e| e.to_string()).and_then(|r| r) {
+                    Ok(off) if !off.is_empty() => {
+                        self.log(format!(
+                            "[app] брандмауэр Windows выключен для профилей: {} — kill switch там не сработает",
+                            off.join(", ")
+                        ));
+                        Ok(())
+                    }
+                    Ok(_) => {
+                        self.log("[app] kill switch включён");
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("kill switch: {e}")),
+                },
+                None => Ok(()),
+            },
+            Err(e) => {
+                if let Some(t) = ks_task {
+                    let _ = t.await;
+                }
+                Err(e)
+            }
+        };
+        started?;
+
+        {
+            let mut rt = self.rt.lock().unwrap();
+            rt.started_at = now();
+            rt.active_sub = Some(sub_id);
+            rt.last_error = None;
+            rt.mode = mode;
+            rt.run = run.clone();
+            rt.gen += 1;
+        }
+        if mode == Mode::Proxy {
+            sysproxy::set(run.mixed_port)?;
+            self.rt.lock().unwrap().sysproxy_on = true;
+        }
+        self.log("[app] подключено");
+        Ok(())
+    }
+
+    /// Windows: запускает Xray (если нужен) и sing-box и ждёт, пока ядро ответит.
+    async fn start_cores(&self, config: &singbox::Built, mode: Mode, run: &Runtime) -> Result<(), String> {
+        // Сначала Xray: sing-box будет подключаться к его SOCKS-входам.
         let xray_child = match &config.xray {
             Some(xcfg) => {
                 write_private(&self.paths.xray_config, xcfg)?;
@@ -818,13 +991,7 @@ impl Engine {
         write_private(&self.paths.config, &config.singbox)?;
         self.log(format!(
             "[app] запуск ядра, режим: {}",
-            if android {
-                "VPN Android"
-            } else if mode == Mode::Tun {
-                "TUN"
-            } else {
-                "системный прокси"
-            }
+            if mode == Mode::Tun { "TUN" } else { "системный прокси" }
         ));
         let cfg_path = self.paths.config.clone();
         let data = self.paths.data.clone();
@@ -849,112 +1016,270 @@ impl Engine {
                 return Err(e);
             }
         };
-        {
+        let clash = {
             let mut rt = self.rt.lock().unwrap();
             rt.child = Some(child);
             rt.xray = xray_child;
-            rt.started_at = now();
-            rt.active_sub = Some(sub_id.clone());
             rt.last_error = None;
-            rt.mode = mode;
             rt.run = run.clone();
-        }
+            (format!("http://127.0.0.1:{}", rt.run.clash_port), rt.run.secret.clone())
+        };
 
-        // Даём ядру подняться и проверяем, что оно живо.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Ждём, пока ядро поднимется (обычно доли секунды), вместо фиксированной паузы.
+        let ready = self.wait_ready(&clash.0, &clash.1).await;
         // Ядра уже прочитали конфиги — файлы с паролями серверов больше не нужны.
-        let _ = std::fs::remove_file(&self.paths.config);
-        let _ = std::fs::remove_file(&self.paths.xray_config);
-        if !self.is_running() {
+        let (c1, c2) = (self.paths.config.clone(), self.paths.xray_config.clone());
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = std::fs::remove_file(c1);
+            let _ = std::fs::remove_file(c2);
+        });
+        if !ready {
             let err = self
                 .rt
                 .lock()
                 .unwrap()
                 .last_error
                 .clone()
-                .unwrap_or_else(|| "ядро завершилось при запуске".into());
-            let hint = if mode == Mode::Tun && !android && err.to_lowercase().contains("access is denied") {
+                .unwrap_or_else(|| "ядро не ответило за 10 секунд".into());
+            let hint = if mode == Mode::Tun && err.to_lowercase().contains("access is denied") {
                 " — для режима TUN запустите приложение от имени администратора"
             } else {
                 ""
             };
             return Err(format!("{err}{hint}"));
         }
-
-        if android {
-            let split = &settings.split;
-            let args = tauri_plugin_tunnelka_vpn::StartArgs {
-                socks_port: run.mixed_port,
-                socks_user: run.socks_user.clone(),
-                socks_pass: run.socks_pass.clone(),
-                app_mode: match split.app_mode {
-                    AppMode::Off => "off",
-                    AppMode::Include => "include",
-                    AppMode::Exclude => "exclude",
-                }
-                .into(),
-                apps: split.active_apps().to_vec(),
-                ipv6: settings.ipv6,
-                session: "Tunnelka".into(),
-            };
-            tauri::async_runtime::spawn_blocking(move || tauri_plugin_tunnelka_vpn::start(args))
-                .await
-                .map_err(|e| e.to_string())??;
-            self.rt.lock().unwrap().vpn_on = true;
-        } else if mode == Mode::Proxy {
-            sysproxy::set(run.mixed_port)?;
-            self.rt.lock().unwrap().sysproxy_on = true;
+        if mode == Mode::Tun {
+            // Windows ещё настраивает маршруты нового адаптера.
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
-
-        if !android && mode == Mode::Tun && allow_fallback && settings.tun_fallback {
-            if let Some(outcome) = self.check_tun(&sub_id).await? {
-                return Ok(outcome);
-            }
-        }
-        self.log("[app] подключено");
-        Ok(Outcome::Ok)
+        Ok(())
     }
 
-    /// Проверяет, что в режиме TUN есть интернет. None — всё в порядке.
-    async fn check_tun(&self, sub_id: &str) -> Result<Option<Outcome>, String> {
-        if self.internet_works().await {
-            return Ok(None);
+    /// Ждёт ответа Clash API ядра. false — ядро завершилось или не ответило.
+    async fn wait_ready(&self, base: &str, secret: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !self.is_running() {
+                return false;
+            }
+            let ok = self
+                .http
+                .get(format!("{base}/version"))
+                .bearer_auth(secret)
+                .timeout(Duration::from_millis(500))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if ok {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Android: сохраняет конфиги и профиль и запускает VPN-сервис, который
+    /// сам запускает ядра. Повторный запуск перезапускает подключение.
+    async fn start_android(
+        &self,
+        config: singbox::Built,
+        sub_id: String,
+        settings: Settings,
+        run: Runtime,
+        server_name: String,
+    ) -> Result<(), String> {
+        let dir = self.paths.vpn_dir.clone();
+        // Выбор сервера из настроек важнее запомненного ядром.
+        let _ = std::fs::remove_file(dir.join("cache.db"));
+        let mut processes = vec![];
+        let _ = std::fs::remove_file(&self.paths.xray_config);
+        if let Some(xcfg) = &config.xray {
+            write_private(&self.paths.xray_config, xcfg)?;
+            processes.push(ProcSpec {
+                name: "Xray".into(),
+                exe: self.paths.xray.to_string_lossy().into_owned(),
+                args: vec!["run".into(), "-c".into(), self.paths.xray_config.to_string_lossy().into_owned()],
+            });
+        }
+        write_private(&self.paths.config, &config.singbox)?;
+        processes.push(ProcSpec {
+            name: "sing-box".into(),
+            exe: self.paths.singbox.to_string_lossy().into_owned(),
+            args: vec![
+                "run".into(),
+                "-c".into(),
+                self.paths.config.to_string_lossy().into_owned(),
+                "-D".into(),
+                dir.to_string_lossy().into_owned(),
+                "--disable-color".into(),
+            ],
+        });
+        let split = &settings.split;
+        let profile = VpnProfile {
+            session: "Tunnelka".into(),
+            server: server_name,
+            notify: settings.notification,
+            socks_port: run.mixed_port,
+            socks_user: run.socks_user.clone(),
+            socks_pass: run.socks_pass.clone(),
+            app_mode: match split.app_mode {
+                AppMode::Off => "off",
+                AppMode::Include => "include",
+                AppMode::Exclude => "exclude",
+            }
+            .into(),
+            apps: split.active_apps().to_vec(),
+            work_dir: dir.to_string_lossy().into_owned(),
+            log: self.core_log().to_string_lossy().into_owned(),
+            env: HashMap::from([(
+                "XRAY_LOCATION_ASSET".to_string(),
+                self.paths.ruleset_dir.to_string_lossy().into_owned(),
+            )]),
+            processes,
+            runtime: run.clone(),
+            active_sub: sub_id.clone(),
+        };
+        let path = self.profile_path();
+        write_private(&path, &serde_json::to_value(&profile).map_err(|e| e.to_string())?)?;
+        self.log(format!(
+            "[app] запуск VPN{}",
+            if config.xray.is_some() { " (sing-box + Xray)" } else { "" }
+        ));
+        {
+            let mut rt = self.rt.lock().unwrap();
+            rt.run = run;
+            rt.mode = Mode::Tun;
+        }
+        let args = tauri_plugin_tunnelka_vpn::StartArgs {
+            profile: path.to_string_lossy().into_owned(),
+            notify: settings.notification,
+        };
+        tauri::async_runtime::spawn_blocking(move || tauri_plugin_tunnelka_vpn::start(args))
+            .await
+            .map_err(|e| e.to_string())??;
+        {
+            let mut rt = self.rt.lock().unwrap();
+            rt.vpn_on = true;
+            rt.paused = false;
+            rt.started_at = now();
+            rt.active_sub = Some(sub_id);
+            rt.last_error = None;
+            rt.gen += 1;
+        }
+        self.log("[app] подключено");
+        Ok(())
+    }
+
+    /// Android: обновляет поля профиля работающего VPN (название сервера в
+    /// уведомлении, показ уведомления).
+    fn refresh_profile(&self) {
+        if PLATFORM != Platform::Android || !self.is_running() {
+            return;
+        }
+        let Some(mut p) = self.read_profile() else { return };
+        {
+            let st = self.state.lock().unwrap();
+            p.server = Self::selected_name(&st).map(|n| n.0).unwrap_or_default();
+            p.notify = st.settings.notification;
+        }
+        if let Ok(v) = serde_json::to_value(&p) {
+            if write_private(&self.profile_path(), &v).is_ok() {
+                let _ = tauri_plugin_tunnelka_vpn::refresh();
+            }
+        }
+    }
+
+    /// Фоновая проверка после подключения в режиме TUN (Windows).
+    async fn tun_watch(self: Arc<Self>, gen: u64) {
+        let same = |me: &Self| {
+            let rt = me.rt.lock().unwrap();
+            rt.gen == gen && rt.child.is_some() && !rt.busy
+        };
+        let done = |me: &Self| me.rt.lock().unwrap().checking = false;
+        if self.internet_works().await || !same(&self) {
+            done(&self);
+            return;
         }
         self.log("[app] через TUN нет интернета, проверяю серверы");
-        if self.server_delay(TAG_PROXY).await.is_some() {
+        let sub_id = self.rt.lock().unwrap().active_sub.clone().unwrap_or_default();
+        let tun_broken = if self.server_delay(TAG_PROXY).await.is_some() {
             // Сервер отвечает, а программы в интернет выйти не могут — TUN не работает.
-            return Ok(Some(Outcome::TunBroken));
-        }
-        // Текущий сервер не отвечает: ищем рабочий.
-        let pings = self.ping(sub_id).await;
-        let best = pings
-            .into_iter()
-            .filter(|(_, ms)| *ms > 0)
-            .min_by_key(|(_, ms)| *ms)
-            .map(|(id, _)| id);
-        let Some(best) = best else {
-            return Err("ни один сервер подписки не отвечает".into());
+            true
+        } else {
+            // Текущий сервер не отвечает: ищем рабочий.
+            let pings = self.ping(&sub_id).await;
+            let best = pings
+                .into_iter()
+                .filter(|(_, ms)| *ms > 0)
+                .min_by_key(|(_, ms)| *ms)
+                .map(|(id, _)| id);
+            match best {
+                None => {
+                    if same(&self) {
+                        self.rt.lock().unwrap().notice =
+                            Some("Ни один сервер подписки сейчас не отвечает".into());
+                    }
+                    done(&self);
+                    return;
+                }
+                Some(best) => {
+                    if !same(&self) || self.clash_select(&best).await.is_err() {
+                        done(&self);
+                        return;
+                    }
+                    if self.internet_works().await {
+                        let name = {
+                            let st = self.state.lock().unwrap();
+                            find_selection(&st.subscriptions, &best)
+                                .and_then(|(_, s)| s.map(|s| s.name.clone()))
+                                .unwrap_or_default()
+                        };
+                        self.rt.lock().unwrap().notice =
+                            Some(format!("Выбранный сервер не отвечал — подключено через «{name}»"));
+                        done(&self);
+                        return;
+                    }
+                    true
+                }
+            }
         };
-        self.clash_select(&best).await?;
-        let name = {
-            let st = self.state.lock().unwrap();
-            find_selection(&st.subscriptions, &best)
-                .and_then(|(_, s)| s.map(|s| s.name.clone()))
-                .unwrap_or_default()
-        };
-        if self.internet_works().await {
-            self.rt.lock().unwrap().notice =
-                Some(format!("Выбранный сервер не отвечал — подключено через «{name}»"));
-            return Ok(None);
+        if !tun_broken || !same(&self) {
+            done(&self);
+            return;
         }
-        Ok(Some(Outcome::TunBroken))
+        self.log("[app] в режиме TUN нет интернета — переключаюсь на системный прокси");
+        {
+            let mut rt = self.rt.lock().unwrap();
+            if rt.busy {
+                rt.checking = false;
+                return;
+            }
+            rt.busy = true;
+        }
+        let res = self.connect_inner(Mode::Proxy).await;
+        if res.is_err() {
+            self.stop_process();
+        }
+        let mut rt = self.rt.lock().unwrap();
+        rt.busy = false;
+        rt.checking = false;
+        match res {
+            Ok(()) => {
+                rt.notice = Some(
+                    "В режиме TUN не было интернета (такое бывает у некоторых провайдеров) — включён системный прокси".into(),
+                )
+            }
+            Err(e) => rt.last_error = Some(e),
+        }
     }
 
     /// Есть ли выход в интернет обычным путём (в режиме TUN — через туннель).
     async fn internet_works(&self) -> bool {
         let client = match reqwest::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(4))
             .pool_max_idle_per_host(0)
             .build()
         {
@@ -966,12 +1291,19 @@ impl Engine {
             "http://www.gstatic.com/generate_204",
         ];
         for attempt in 0..3 {
-            for url in URLS {
-                if let Ok(r) = client.get(url).send().await {
-                    if r.status().is_success() {
-                        return true;
-                    }
+            // Оба адреса проверяются одновременно, хватит одного ответа.
+            let checks = URLS.iter().map(|u| {
+                let c = client.clone();
+                async move {
+                    c.get(*u)
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false)
                 }
+            });
+            if join_all(checks).await.into_iter().any(|ok| ok) {
+                return true;
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -988,12 +1320,15 @@ impl Engine {
         v["delay"].as_i64().filter(|d| *d > 0)
     }
 
-    /// Останавливает ядра, туннель и системный прокси. Kill switch не трогает.
+    /// Останавливает ядра, VPN и системный прокси. Kill switch не трогает.
     fn stop_process(&self) {
         let mut rt = self.rt.lock().unwrap();
-        if rt.vpn_on {
-            let _ = tauri_plugin_tunnelka_vpn::stop();
+        if PLATFORM == Platform::Android {
+            if rt.vpn_on || tauri_plugin_tunnelka_vpn::state().active() {
+                let _ = tauri_plugin_tunnelka_vpn::stop();
+            }
             rt.vpn_on = false;
+            rt.paused = false;
         }
         for c in [rt.child.take(), rt.xray.take()].into_iter().flatten() {
             let mut c = c;
@@ -1006,8 +1341,12 @@ impl Engine {
         }
         rt.active_sub = None;
         rt.started_at = 0;
-        let _ = std::fs::remove_file(&self.paths.config);
-        let _ = std::fs::remove_file(&self.paths.xray_config);
+        rt.checking = false;
+        rt.gen += 1;
+        if PLATFORM != Platform::Android {
+            let _ = std::fs::remove_file(&self.paths.config);
+            let _ = std::fs::remove_file(&self.paths.xray_config);
+        }
     }
 
     /// Отключение по кнопке: ядра останавливаются, kill switch снимается.
@@ -1032,7 +1371,7 @@ impl Engine {
     }
 
     #[cfg_attr(mobile, allow(dead_code))]
-    pub async fn toggle(&self) -> Result<Status, String> {
+    pub async fn toggle(self: &Arc<Self>) -> Result<Status, String> {
         if self.is_running() {
             Ok(self.disconnect())
         } else {
@@ -1040,7 +1379,7 @@ impl Engine {
         }
     }
 
-    pub async fn restart_if_running(&self) -> Result<(), String> {
+    pub async fn restart_if_running(self: &Arc<Self>) -> Result<(), String> {
         if self.is_running() {
             self.connect().await.map(|_| ())
         } else {
@@ -1049,7 +1388,7 @@ impl Engine {
     }
 
     /// Выбор сервера. Если ядро запущено с той же подпиской — переключаем на лету.
-    pub async fn select(&self, sel: &str) -> Result<Status, String> {
+    pub async fn select(self: &Arc<Self>, sel: &str) -> Result<Status, String> {
         let target_sub = {
             let mut st = self.state.lock().unwrap();
             let (sub, _) =
@@ -1062,7 +1401,7 @@ impl Engine {
         let active = {
             let mut rt = self.rt.lock().unwrap();
             self.reap(&mut rt);
-            rt.child.as_ref().and(rt.active_sub.clone())
+            if Self::live(&rt) && !rt.paused { rt.active_sub.clone() } else { None }
         };
         match active {
             Some(a) if a == target_sub => {
@@ -1073,6 +1412,8 @@ impl Engine {
                 if let Err(e) = self.clash_select(&tag).await {
                     self.log(format!("[app] переключение на лету не удалось ({e}), перезапуск"));
                     self.connect().await?;
+                } else {
+                    self.refresh_profile();
                 }
             }
             Some(_) => {
@@ -1083,7 +1424,7 @@ impl Engine {
         Ok(self.status())
     }
 
-    pub async fn save_settings(&self, mut new: Settings) -> Result<Status, String> {
+    pub async fn save_settings(self: &Arc<Self>, mut new: Settings) -> Result<Status, String> {
         let old = self.settings();
         if new.mixed_port != 0 && new.mixed_port < 1024 {
             return Err(format!("порт {} недопустим, используйте 1024–65535 или 0", new.mixed_port));
@@ -1105,14 +1446,18 @@ impl Engine {
             for s in [&mut a, &mut b] {
                 s.autostart = false;
                 s.auto_connect = false;
+                s.notification = true;
                 s.user_agent.clear();
             }
             a != b
         };
+        let notify_changed = old.notification != new.notification;
         self.state.lock().unwrap().settings = new;
         self.save();
         if connection_changed {
             self.restart_if_running().await?;
+        } else if notify_changed {
+            self.refresh_profile();
         }
         Ok(self.status())
     }
@@ -1148,8 +1493,12 @@ impl Engine {
     }
 
     pub async fn traffic(&self) -> Option<Traffic> {
-        if !self.is_running() {
-            return None;
+        {
+            let mut rt = self.rt.lock().unwrap();
+            self.reap(&mut rt);
+            if !Self::live(&rt) || rt.paused {
+                return None;
+            }
         }
         let (base, secret) = self.clash_base();
         let v: serde_json::Value = self
@@ -1185,7 +1534,7 @@ impl Engine {
         let live = {
             let mut rt = self.rt.lock().unwrap();
             self.reap(&mut rt);
-            rt.child.is_some() && rt.active_sub.as_deref() == Some(sub_id)
+            Self::live(&rt) && !rt.paused && rt.active_sub.as_deref() == Some(sub_id)
         };
         let (base, secret) = self.clash_base();
         let tasks: Vec<_> = servers

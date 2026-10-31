@@ -15,17 +15,13 @@ pub struct AndroidInfo {
     pub sdk: i32,
 }
 
+/// Запуск VPN. Сервис сам запускает ядра по профилю (JSON-файл), поэтому
+/// может включиться и без приложения: из плитки в шторке или «Постоянной VPN».
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartArgs {
-    pub socks_port: u16,
-    pub socks_user: String,
-    pub socks_pass: String,
-    /// "off" | "include" | "exclude"
-    pub app_mode: String,
-    pub apps: Vec<String>,
-    pub ipv6: bool,
-    pub session: String,
+    pub profile: String,
+    pub notify: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,10 +31,32 @@ pub struct AppInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct VpnState {
+    /// "stopped" | "starting" | "running" | "paused"
+    #[serde(default)]
+    pub state: String,
+    /// Туннель поднят и работает.
+    #[serde(default)]
     pub running: bool,
+    /// Время подключения, секунды Unix.
+    #[serde(default)]
+    pub started_at: u64,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+impl VpnState {
+    /// Сервис занят VPN (подключается, работает или на паузе).
+    pub fn active(&self) -> bool {
+        matches!(self.state.as_str(), "starting" | "running" | "paused")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Battery {
+    #[serde(default)]
+    pub unrestricted: bool,
 }
 
 #[cfg(target_os = "android")]
@@ -107,6 +125,47 @@ pub fn state() -> VpnState {
     return imp::call("state", ()).unwrap_or_default();
     #[cfg(not(target_os = "android"))]
     VpnState::default()
+}
+
+/// Сервис перечитывает профиль (название сервера, показ уведомления).
+pub fn refresh() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = imp::call("refresh", ())?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(())
+}
+
+/// Ограничивает ли система работу приложения в фоне (экономия батареи).
+pub fn battery() -> Battery {
+    #[cfg(target_os = "android")]
+    return imp::call("battery", ()).unwrap_or_default();
+    #[cfg(not(target_os = "android"))]
+    Battery { unrestricted: true }
+}
+
+/// Открывает системный запрос «Не ограничивать работу в фоне».
+pub fn open_battery_settings() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = imp::call("openBatterySettings", ())?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    Err("только для Android".into())
+}
+
+/// Открывает настройки уведомлений приложения.
+pub fn open_notification_settings() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = imp::call("openNotificationSettings", ())?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    Err("только для Android".into())
 }
 
 /// Установленные приложения с иконкой на рабочем столе.

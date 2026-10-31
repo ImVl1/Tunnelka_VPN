@@ -104,10 +104,14 @@ const MODE_HINT = {
 function renderHome() {
   const on = !!status?.running;
   const busy = !!status?.busy;
-  document.body.classList.toggle("on", on);
+  const paused = !!status?.paused;
+  document.body.classList.toggle("on", on && !paused);
   document.body.classList.toggle("busy", busy);
-  $("#power").setAttribute("aria-label", on ? "Отключить" : "Подключить");
-  $("#state-title").textContent = busy ? "Подключение…" : on ? "Подключено" : "Не подключено";
+  document.body.classList.toggle("paused", paused);
+  $("#power").setAttribute("aria-label", on && !paused ? "Отключить" : "Подключить");
+  $("#state-title").textContent = busy ? "Подключение…" : paused ? "Пауза" : on ? "Подключено" : "Не подключено";
+  $("#state-pill-text").textContent = busy ? "Подключение" : paused ? "VPN на паузе"
+    : on ? (status.checking ? "Проверяю интернет…" : "Защищено") : "Не подключено";
   const sub = $("#state-sub");
   sub.classList.remove("error");
   if (!status?.core_found) {
@@ -116,32 +120,34 @@ function renderHome() {
   } else if (!status?.xray_found && needsXray()) {
     sub.textContent = "Для XHTTP-серверов нужно ядро Xray. Переустановите приложение.";
     sub.classList.add("error");
-  } else if (status?.last_error && !on) {
+  } else if (status?.last_error && !on && !busy) {
     sub.textContent = status.last_error;
     sub.classList.add("error");
+  } else if (paused) {
+    sub.textContent = "Трафик идёт напрямую. Нажмите на тоннель, чтобы продолжить";
   } else if (on) {
-    sub.textContent = isAndroid() ? "Весь трафик телефона идёт через VPN"
-      : status.mode === "tun" ? "Режим TUN" : `Системный прокси 127.0.0.1:${status.mixed_port}`;
+    sub.textContent = isAndroid() ? "Трафик телефона идёт через VPN"
+      : status.mode === "tun" ? "Весь трафик компьютера идёт через VPN" : `Системный прокси 127.0.0.1:${status.mixed_port}`;
+  } else if (busy) {
+    sub.textContent = "Запускаю ядро и проверяю сервер";
   } else {
     sub.textContent = "Нажмите на тоннель, чтобы подключиться";
   }
-  $("#stats").hidden = !on;
+  $("#stats").hidden = !on || paused;
   const notice = $("#notice");
   notice.hidden = !(on && status?.notice);
   notice.textContent = status?.notice ?? "";
   $("#unblock").hidden = on || !status?.kill_switch_active;
   $("#current-name").textContent = status?.selected_name ?? "Не выбран — добавьте подписку";
   const mode = data?.settings.mode ?? "tun";
-  $$(".seg button").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
+  $$("[data-mode]").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
   $("#mode-hint").textContent = MODE_HINT[mode];
-  const foot = $("#side-status");
-  foot.textContent = on ? `Подключено · ${status.selected_name ?? ""}` : "Не подключено";
-  foot.classList.toggle("on", on);
+  renderSideOnly();
 }
 
 $("#power").onclick = async () => {
   if (status?.busy) return;
-  if (status?.running) {
+  if (status?.running && !status?.paused) {
     status = await call("disconnect");
   } else {
     if (!data?.selected) { show("servers"); return toast("Сначала добавьте подписку и выберите сервер", true); }
@@ -157,7 +163,7 @@ $("#unblock").onclick = async () => {
   renderHome();
 };
 
-$$(".seg button").forEach((b) => (b.onclick = async () => {
+$$("[data-mode]").forEach((b) => (b.onclick = async () => {
   if (data.settings.mode === b.dataset.mode) return;
   const settings = { ...data.settings, mode: b.dataset.mode };
   await call("save_settings", { settings }, status?.running ? "Режим изменён, подключение перезапущено" : "Режим изменён");
@@ -183,14 +189,15 @@ async function poll() {
       lastTraffic = null;
     }
     if (view === "home") renderHome(); else renderSideOnly();
+    if (view === "settings" && isAndroid() && ++batteryTick % 5 === 0) renderBattery();
     if (view === "logs") loadLogs();
   } catch { /* окно в фоне */ }
 }
 
 function renderSideOnly() {
   const foot = $("#side-status");
-  const on = !!status?.running;
-  foot.textContent = on ? `Подключено · ${status.selected_name ?? ""}` : "Не подключено";
+  const on = !!status?.running && !status?.paused;
+  foot.querySelector("span").textContent = status?.paused ? "Пауза" : on ? `Подключено · ${status.selected_name ?? ""}` : "Не подключено";
   foot.classList.toggle("on", on);
   document.body.classList.toggle("on", on);
 }
@@ -239,18 +246,18 @@ function renderServers() {
   if (sub.url && sub.updated_at) meta.push(`обновлена ${new Date(sub.updated_at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" })}`);
   const pct = info?.total ? Math.min(100, ((info.upload + info.download) / info.total) * 100) : null;
   const links = [
-    sub.support_url && `<button class="icon" data-open="${esc(sub.support_url)}">Поддержка</button>`,
-    sub.web_page_url && `<button class="icon" data-open="${esc(sub.web_page_url)}">Сайт</button>`,
+    sub.support_url && `<button class="btn small" data-open="${esc(sub.support_url)}">Поддержка</button>`,
+    sub.web_page_url && `<button class="btn small" data-open="${esc(sub.web_page_url)}">Сайт</button>`,
   ].filter(Boolean).join("");
   $("#sub-card").innerHTML = `
     <div class="sub-card">
       <div class="meta">${meta.map(esc).map((m) => `<span>${m}</span>`).join("")}</div>
       <div class="sub-actions">
         ${links}
-        <button class="ghost" id="ping-btn">Проверить пинг</button>
-        ${sub.url ? `<button class="ghost" id="upd-btn">Обновить</button>` : ""}
-        <button class="ghost" id="ren-btn">Переименовать</button>
-        <button class="ghost" id="del-btn">Удалить</button>
+        <button class="btn small" id="ping-btn">Проверить пинг</button>
+        ${sub.url ? `<button class="btn small" id="upd-btn">Обновить</button>` : ""}
+        <button class="btn small" id="ren-btn">Переименовать</button>
+        <button class="btn small" id="del-btn">Удалить</button>
       </div>
       ${pct !== null ? `<div class="usage"><i class="${pct > 85 ? "high" : ""}" style="width:${pct}%"></i></div>` : ""}
       ${sub.announce ? `<div class="announce">${esc(sub.announce)}</div>` : ""}
@@ -467,7 +474,7 @@ const FIELDS = [
 ];
 const CHECKS = [
   ["#s-ipv6", "ipv6"], ["#s-lan", "allow_lan"], ["#s-auto", "auto_connect"], ["#s-autostart", "autostart"],
-  ["#s-killswitch", "kill_switch"], ["#s-fallback", "tun_fallback"],
+  ["#s-killswitch", "kill_switch"], ["#s-fallback", "tun_fallback"], ["#s-notify", "notification"],
 ];
 
 function renderSettings() {
@@ -476,6 +483,7 @@ function renderSettings() {
   for (const [sel, key] of CHECKS) $(sel).checked = s[key];
   $("#lan-pass").textContent = s.lan_password;
   $("#lan-info").hidden = !s.allow_lan;
+  if (isAndroid() && !renderSettings.battery) { renderSettings.battery = true; renderBattery(); }
 }
 $("#s-lan").onchange = (e) => ($("#lan-info").hidden = !e.target.checked);
 
@@ -487,6 +495,19 @@ $("#settings-save").onclick = async () => {
   await reload();
 };
 $("#open-vpn-settings").onclick = () => call("open_vpn_settings");
+$("#open-notify-settings").onclick = () => call("open_notification_settings");
+$("#battery-btn").onclick = async () => { await call("open_battery_settings"); setTimeout(renderBattery, 1500); };
+
+let batteryTick = 0;
+async function renderBattery() {
+  try {
+    const free = await invoke("battery_status");
+    $("#battery-btn").hidden = free;
+    $("#battery-hint").textContent = free
+      ? "Работа в фоне не ограничена: система не будет выключать VPN для экономии батареи."
+      : "Система может останавливать приложения в фоне для экономии батареи. Чтобы VPN не выключался, разрешите Tunnelka работать без ограничений. На Samsung также уберите Tunnelka из «Спящих приложений».";
+  } catch { /* не Android */ }
+}
 
 // ---------------------------------------------------------------------------
 // журнал
@@ -517,6 +538,7 @@ function render() {
     status = await invoke("status");
     platform = status.platform;
     document.body.classList.add(`p-${platform}`);
+    window.__TAURI__?.app?.getVersion?.().then((v) => ($("#app-version").textContent = v)).catch(() => {});
     await reload();
   } catch (e) {
     toast(String(e), true);

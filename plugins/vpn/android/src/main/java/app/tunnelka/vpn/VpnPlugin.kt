@@ -23,13 +23,10 @@ import app.tauri.plugin.Plugin
 
 @InvokeArg
 class StartArgs {
-    var socksPort: Int = 0
-    var socksUser: String = ""
-    var socksPass: String = ""
-    var appMode: String = "off"
-    var apps: List<String> = emptyList()
-    var ipv6: Boolean = false
-    var session: String = "Tunnelka"
+    /** Профиль подключения (JSON), который подготовило приложение. */
+    var profile: String = ""
+    /** Показывать уведомление — тогда спрашиваем разрешение на уведомления. */
+    var notify: Boolean = true
 }
 
 @TauriPlugin
@@ -50,7 +47,7 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun start(invoke: Invoke) {
         val args = invoke.parseArgs(StartArgs::class.java)
-        askNotifications()
+        if (args.notify) askNotifications()
         val prepare = VpnService.prepare(activity)
         if (prepare != null) {
             // Система спросит у пользователя разрешение на VPN.
@@ -73,41 +70,47 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private fun launch(invoke: Invoke, args: StartArgs) {
-        val intent = Intent(activity, TunnelkaVpnService::class.java).apply {
-            action = TunnelkaVpnService.ACTION_START
-            putExtra("socksPort", args.socksPort)
-            putExtra("socksUser", args.socksUser)
-            putExtra("socksPass", args.socksPass)
-            putExtra("appMode", args.appMode)
-            putStringArrayListExtra("apps", ArrayList(args.apps))
-            putExtra("ipv6", args.ipv6)
-            putExtra("session", args.session)
+        TunnelkaVpnService.setProfilePath(activity, args.profile)
+        TunnelkaVpnService.markStarting()
+        try {
+            ContextCompat.startForegroundService(
+                activity, TunnelkaVpnService.intent(activity, TunnelkaVpnService.ACTION_START)
+            )
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: e.toString())
+            return
         }
-        ContextCompat.startForegroundService(activity, intent)
-        // Ждём, пока сервис поднимет туннель или сообщит об ошибке.
+        // Ждём, пока сервис запустит ядра и поднимет туннель или сообщит об ошибке.
         val started = System.currentTimeMillis()
         val check = object : Runnable {
             override fun run() {
+                val st = TunnelkaVpnService.state
                 when {
                     TunnelkaVpnService.alive() -> invoke.resolve(JSObject())
-                    TunnelkaVpnService.lastError != null ->
-                        invoke.reject(TunnelkaVpnService.lastError)
-                    System.currentTimeMillis() - started > 8000 ->
-                        invoke.reject("VPN-сервис не запустился")
-                    else -> main.postDelayed(this, 100)
+                    st == TunnelkaVpnService.State.STOPPED ->
+                        invoke.reject(TunnelkaVpnService.lastError ?: "VPN-сервис остановился")
+                    System.currentTimeMillis() - started > 20_000 ->
+                        invoke.reject("VPN-сервис не запустился за 20 секунд")
+                    else -> main.postDelayed(this, 50)
                 }
             }
         }
-        main.postDelayed(check, 100)
+        main.postDelayed(check, 50)
     }
 
     @Command
     fun stop(invoke: Invoke) {
-        val intent = Intent(activity, TunnelkaVpnService::class.java).apply {
-            action = TunnelkaVpnService.ACTION_STOP
+        if (TunnelkaVpnService.state != TunnelkaVpnService.State.STOPPED) {
+            activity.startService(TunnelkaVpnService.intent(activity, TunnelkaVpnService.ACTION_STOP))
         }
-        if (TunnelkaVpnService.running) {
-            activity.startService(intent)
+        invoke.resolve(JSObject())
+    }
+
+    /** Перечитать профиль (например, название сервера или показ уведомления). */
+    @Command
+    fun refresh(invoke: Invoke) {
+        if (TunnelkaVpnService.state != TunnelkaVpnService.State.STOPPED) {
+            activity.startService(TunnelkaVpnService.intent(activity, TunnelkaVpnService.ACTION_REFRESH))
         }
         invoke.resolve(JSObject())
     }
@@ -115,9 +118,49 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun state(invoke: Invoke) {
         val r = JSObject()
+        r.put("state", TunnelkaVpnService.state.name.lowercase())
         r.put("running", TunnelkaVpnService.alive())
+        r.put("startedAt", TunnelkaVpnService.startedAt)
+        TunnelkaVpnService.profilePath(activity)?.let { r.put("profile", it) }
         TunnelkaVpnService.lastError?.let { r.put("error", it) }
         invoke.resolve(r)
+    }
+
+    /** Работает ли приложение без ограничений экономии батареи. */
+    @Command
+    fun battery(invoke: Invoke) {
+        val r = JSObject()
+        val pm = activity.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+        r.put("unrestricted", Build.VERSION.SDK_INT < 23 || pm.isIgnoringBatteryOptimizations(activity.packageName))
+        invoke.resolve(r)
+    }
+
+    @Command
+    fun openBatterySettings(invoke: Invoke) {
+        val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            .setData(android.net.Uri.parse("package:" + activity.packageName))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            activity.startActivity(direct)
+        } catch (_: Exception) {
+            activity.startActivity(
+                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+        invoke.resolve(JSObject())
+    }
+
+    @Command
+    fun openNotificationSettings(invoke: Invoke) {
+        val intent = if (Build.VERSION.SDK_INT >= 26) {
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName)
+        } else {
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(android.net.Uri.parse("package:" + activity.packageName))
+        }
+        activity.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        invoke.resolve(JSObject())
     }
 
     @Command
