@@ -47,13 +47,20 @@ pub const TUN_ADDR6: &str = "fdfe:dcba:9876::1/126";
 
 /// Сколько серверов пойдёт через Xray (нужно заранее выделить им порты).
 pub fn xray_count(servers: &[&Server], settings: &Settings) -> usize {
-    servers.iter().filter(|s| uses_xray(s, settings)).count()
+    servers
+        .iter()
+        .filter(|s| uses_xray(s, settings))
+        .map(|s| s.xray.as_ref().map(|x| xray::expand(x).len()).unwrap_or(1))
+        .sum()
 }
 
 /// Готовые конфигурации: sing-box всегда, Xray — если есть серверы для него.
 pub struct Built {
     pub singbox: Value,
     pub xray: Option<Value>,
+    /// Серверы с автовыбором внутри (балансировщик провайдера): id сервера →
+    /// теги его частей. Пинг такого сервера — лучший из пингов частей.
+    pub groups: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Через какое ядро пойдёт сервер.
@@ -279,6 +286,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
     let mut tags = vec![];
     let mut xray_entries: Vec<(String, u16, Value)> = vec![];
     let mut xray_hosts: Vec<String> = vec![];
+    let mut groups = std::collections::HashMap::new();
     for s in &input.servers {
         let ob = if uses_xray(s, st) {
             if input.xray_process.is_none() {
@@ -287,22 +295,45 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
                 }
                 continue;
             }
-            let port = *rt
-                .xray_ports
-                .get(xray_entries.len())
-                .ok_or("не хватило портов для Xray")?;
             let xv = s.xray.clone().unwrap();
             xray_hosts.extend(xray::hosts(&xv));
-            xray_entries.push((s.id.clone(), port, xv));
-            json!({
-                "type": "socks",
-                "tag": s.id,
-                "server": "127.0.0.1",
-                "server_port": port,
-                "version": "5",
-                "username": rt.socks_user,
-                "password": rt.socks_pass
-            })
+            let parts = xray::expand(&xv);
+            let socks = |tag: &str, port: u16| {
+                json!({
+                    "type": "socks",
+                    "tag": tag,
+                    "server": "127.0.0.1",
+                    "server_port": port,
+                    "version": "5",
+                    "username": rt.socks_user,
+                    "password": rt.socks_pass
+                })
+            };
+            let next_port = |used: usize| rt.xray_ports.get(used).copied().ok_or("не хватило портов для Xray");
+            if parts.len() == 1 {
+                let port = next_port(xray_entries.len())?;
+                xray_entries.push((s.id.clone(), port, parts.into_iter().next().unwrap()));
+                socks(&s.id, port)
+            } else {
+                // Автовыбор провайдера: части — отдельные входы Xray, выбирает sing-box.
+                let mut members = vec![];
+                for (i, part) in parts.into_iter().enumerate() {
+                    let port = next_port(xray_entries.len())?;
+                    let tag = format!("{}~{i}", s.id);
+                    xray_entries.push((tag.clone(), port, part));
+                    outbounds.push(socks(&tag, port));
+                    members.push(tag);
+                }
+                groups.insert(s.id.clone(), members.clone());
+                json!({
+                    "type": "urltest",
+                    "tag": s.id,
+                    "outbounds": members,
+                    "url": URL_TEST,
+                    "interval": "3m",
+                    "tolerance": 50
+                })
+            }
         } else {
             let mut ob = s.outbound.clone().ok_or("сервер без конфигурации")?;
             ob["tag"] = json!(s.id);
@@ -582,7 +613,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         "route": route,
         "experimental": experimental
     });
-    Ok(Built { singbox, xray: xray_cfg })
+    Ok(Built { singbox, xray: xray_cfg, groups })
 }
 
 #[cfg(test)]

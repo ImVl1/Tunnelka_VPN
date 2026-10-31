@@ -89,6 +89,8 @@ struct Rt {
     /// Режим, в котором реально работает подключение.
     mode: Mode,
     run: Runtime,
+    /// Серверы с автовыбором внутри: id → теги частей (см. singbox::Built).
+    groups: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +254,8 @@ struct VpnProfile {
     /// Для приложения: порты и ключи Clash API, если VPN включили без него.
     runtime: Runtime,
     active_sub: String,
+    #[serde(default)]
+    groups: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -695,6 +699,7 @@ impl Engine {
                 if let Some(p) = self.read_profile() {
                     rt.vpn_on = true;
                     rt.run = p.runtime;
+                    rt.groups = p.groups;
                     rt.active_sub = Some(p.active_sub);
                     rt.mode = Mode::Tun;
                     rt.last_error = None;
@@ -1038,6 +1043,7 @@ impl Engine {
             rt.xray = xray_child;
             rt.last_error = None;
             rt.run = run.clone();
+            rt.groups = config.groups.clone();
             (format!("http://127.0.0.1:{}", rt.run.clash_port), rt.run.secret.clone())
         };
 
@@ -1156,6 +1162,7 @@ impl Engine {
             processes,
             runtime: run.clone(),
             active_sub: sub_id.clone(),
+            groups: config.groups.clone(),
         };
         let path = self.profile_path();
         write_private(&path, &serde_json::to_value(&profile).map_err(|e| e.to_string())?)?;
@@ -1166,6 +1173,7 @@ impl Engine {
         {
             let mut rt = self.rt.lock().unwrap();
             rt.run = run;
+            rt.groups = config.groups.clone();
             rt.mode = Mode::Tun;
         }
         let args = tauri_plugin_tunnelka_vpn::StartArgs {
@@ -1218,11 +1226,32 @@ impl Engine {
         };
         let done = |me: &Self| me.rt.lock().unwrap().checking = false;
 
-        // Ядру нужно мгновение, чтобы автовыбор проверил серверы.
-        let mut ok = self.server_delay(TAG_PROXY).await.is_some();
-        if !ok && same(&self) {
-            tokio::time::sleep(Duration::from_millis(800)).await;
-            ok = self.server_delay(TAG_PROXY).await.is_some();
+        // Сервер считается неработающим только после нескольких проверок: сразу
+        // после запуска автовыбор (общий или внутри сервера) ещё мог не успеть
+        // проверить свои серверы — проверку групп запускаем сами.
+        let mut ok = false;
+        for attempt in 0..3 {
+            if !same(&self) {
+                break;
+            }
+            if self.server_delay(TAG_PROXY).await.is_some() {
+                ok = true;
+                break;
+            }
+            let selected = self.state.lock().unwrap().selected.clone();
+            let groups = self.rt.lock().unwrap().groups.clone();
+            let group = match selected.as_deref().map(Selection::parse) {
+                Some(Selection::Auto(_)) => Some(TAG_AUTO.to_string()),
+                Some(Selection::Server(id)) => groups.contains_key(&id).then_some(id),
+                None => None,
+            };
+            if let Some(g) = group {
+                let (base, secret) = self.clash_base();
+                let _ = group_delay(&self.http, &base, &secret, &g).await;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
         }
         if !same(&self) {
             done(&self);
@@ -1343,10 +1372,7 @@ impl Engine {
 
     async fn server_delay(&self, tag: &str) -> Option<i64> {
         let (base, secret) = self.clash_base();
-        let url = format!("{base}/proxies/{tag}/delay?timeout=5000&url={URL_TEST}");
-        let r = self.http.get(url).bearer_auth(secret).send().await.ok()?;
-        let v: serde_json::Value = r.json().await.ok()?;
-        v["delay"].as_i64().filter(|d| *d > 0)
+        proxy_delay(&self.http, &base, &secret, tag).await
     }
 
     /// Останавливает ядра, VPN и системный прокси. Kill switch не трогает.
@@ -1570,7 +1596,8 @@ impl Engine {
         let ids: Vec<String> = servers.iter().map(|s| s.id.clone()).collect();
         if live {
             let (base, secret) = self.clash_base();
-            return self.delays(&base, &secret, ids).await;
+            let groups = self.rt.lock().unwrap().groups.clone();
+            return self.delays(&base, &secret, ids, &groups).await;
         }
         match self.probe(&servers).await {
             Ok(m) => m,
@@ -1585,28 +1612,33 @@ impl Engine {
         }
     }
 
-    /// URL-тест каждого сервера через Clash API ядра.
-    async fn delays(&self, base: &str, secret: &str, ids: Vec<String>) -> HashMap<String, i64> {
+    /// URL-тест каждого сервера через Clash API ядра. Для сервера с автовыбором
+    /// внутри проверяются все его части (это же обновляет выбор), результат —
+    /// лучшая из них.
+    async fn delays(
+        &self,
+        base: &str,
+        secret: &str,
+        ids: Vec<String>,
+        groups: &HashMap<String, Vec<String>>,
+    ) -> HashMap<String, i64> {
         let mut out = HashMap::new();
         let mut iter = ids.into_iter();
         loop {
             // Ограничиваем параллельность, чтобы не душить сеть на больших подписках.
             let chunk: Vec<_> = iter
                 .by_ref()
-                .take(24)
+                .take(16)
                 .map(|id| {
-                    let http = self.http.clone();
-                    let url = format!("{base}/proxies/{id}/delay?timeout=5000&url={URL_TEST}");
-                    let secret = secret.to_string();
+                    let is_group = groups.contains_key(&id);
                     async move {
-                        let ms = match http.get(url).bearer_auth(secret).send().await {
-                            Ok(r) => r
-                                .json::<serde_json::Value>()
+                        let ms = if is_group {
+                            group_delay(&self.http, base, secret, &id)
                                 .await
-                                .ok()
-                                .and_then(|v| v["delay"].as_i64())
-                                .unwrap_or(0),
-                            Err(_) => 0,
+                                .and_then(|m| m.into_values().filter(|d| *d > 0).min())
+                                .unwrap_or(0)
+                        } else {
+                            proxy_delay(&self.http, base, secret, &id).await.unwrap_or(0)
                         };
                         (id, ms)
                     }
@@ -1697,7 +1729,7 @@ impl Engine {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let ids = servers.iter().map(|s| s.id.clone()).collect();
-        Ok(self.delays(&base, &run.secret, ids).await)
+        Ok(self.delays(&base, &run.secret, ids, &built.groups).await)
     }
 
     /// Полный выход из приложения: всё останавливается, интернет разблокируется.
@@ -1724,6 +1756,30 @@ pub fn find_selection<'a>(
                 .map(|srv| (sub, Some(srv)))
         }),
     }
+}
+
+/// Задержка через outbound (сервер или группу) по Clash API, мс.
+async fn proxy_delay(http: &reqwest::Client, base: &str, secret: &str, tag: &str) -> Option<i64> {
+    let url = format!("{base}/proxies/{tag}/delay?timeout=5000&url={URL_TEST}");
+    let v: serde_json::Value = http.get(url).bearer_auth(secret).send().await.ok()?.json().await.ok()?;
+    v["delay"].as_i64().filter(|d| *d > 0)
+}
+
+/// Проверка всех серверов группы (urltest): sing-box заодно выбирает лучший.
+async fn group_delay(http: &reqwest::Client, base: &str, secret: &str, tag: &str) -> Option<HashMap<String, i64>> {
+    let url = format!("{base}/group/{tag}/delay?timeout=5000&url={URL_TEST}");
+    let r = http
+        .get(url)
+        .bearer_auth(secret)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let v: HashMap<String, serde_json::Value> = r.json().await.ok()?;
+    Some(v.into_iter().map(|(k, d)| (k, d.as_i64().unwrap_or(0))).collect())
 }
 
 /// Процессы временной проверки серверов: останавливаются в любом случае.

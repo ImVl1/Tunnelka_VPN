@@ -599,13 +599,8 @@ pub fn build_config(
     let mut inbounds = vec![];
     let mut outbounds = vec![];
     let mut rules = vec![];
-    let mut balancers = vec![];
     let mut dns_hosts = Map::new();
     let mut dns_servers: Vec<Value> = vec![];
-    let mut observe: Vec<String> = vec![];
-    let mut burst: Vec<String> = vec![];
-    let mut observatory: Option<Value> = None;
-    let mut burst_cfg: Option<Value> = None;
     for e in entries {
         let in_tag = format!("in-{}", e.tag);
         inbounds.push(json!({
@@ -629,7 +624,10 @@ pub fn build_config(
             rules.push(json!({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag}));
             continue;
         }
-        if let Some(d) = e.outbound.get("dns") {
+        // Балансировщик провайдера раскладывается на серверы заранее (см. expand),
+        // здесь он мог остаться, только если в нём не нашлось ни одного сервера.
+        let part = expand(e.outbound).into_iter().next().unwrap_or_else(|| e.outbound.clone());
+        if let Some(d) = part.get("dns") {
             if let Some(h) = d["hosts"].as_object() {
                 for (k, v) in h {
                     dns_hosts.entry(k.clone()).or_insert_with(|| v.clone());
@@ -641,9 +639,9 @@ pub fn build_config(
                 }
             }
         }
-        // Связка: теги получают префикс сервера, ссылки между ними переписываются.
+        // Теги получают префикс сервера, ссылки между ними переписываются.
         let pre = |t: &str| format!("{}~{}", e.tag, t);
-        for ob in e.outbound["outbounds"].as_array().into_iter().flatten() {
+        for ob in part["outbounds"].as_array().into_iter().flatten() {
             let mut ob = ob.clone();
             let t = ob["tag"].as_str().unwrap_or("").to_string();
             ob["tag"] = json!(pre(&t));
@@ -658,47 +656,18 @@ pub fn build_config(
             set_resolver(&mut ob, ipv6);
             outbounds.push(ob);
         }
-        match e.outbound.get("balancer").filter(|b| b.is_object()) {
-            Some(b) => {
-                let mut b = b.clone();
-                let bt = pre(b["tag"].as_str().unwrap_or("balancer"));
-                b["tag"] = json!(bt);
-                let sel: Vec<String> = b["selector"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str()).map(|x| pre(x)).collect())
-                    .unwrap_or_default();
-                b["selector"] = json!(sel);
-                if let Some(fb) = b["fallbackTag"].as_str() {
-                    let fb = pre(fb);
-                    b["fallbackTag"] = json!(fb);
-                }
-                match b.pointer("/strategy/type").and_then(|t| t.as_str()) {
-                    Some("leastPing") => {
-                        observe.extend(sel.iter().cloned());
-                        if observatory.is_none() {
-                            observatory = e.outbound.get("observatory").cloned();
-                        }
-                    }
-                    Some("leastLoad") => {
-                        burst.extend(sel.iter().cloned());
-                        if burst_cfg.is_none() {
-                            burst_cfg = e.outbound.get("burstObservatory").cloned();
-                        }
-                    }
-                    _ => {}
-                }
-                rules.push(json!({"type": "field", "inboundTag": [in_tag], "balancerTag": bt}));
-                balancers.push(b);
-            }
-            None => {
-                let main = e.outbound["main"].as_str().unwrap_or("");
-                rules.push(json!({"type": "field", "inboundTag": [in_tag], "outboundTag": pre(main)}));
-            }
+        match part["main"].as_str() {
+            Some(main) => rules.push(json!({"type": "field", "inboundTag": [in_tag], "outboundTag": pre(main)})),
+            // Без основного сервера трафик этого входа уйдёт в блокировку ниже.
+            None => {}
         }
     }
-    // Первый outbound — исходящий по умолчанию. Это должен быть прямой выход:
-    // через него Xray сам разрешает адреса серверов.
-    outbounds.insert(0, json!({"protocol": "freedom", "tag": "direct"}));
+    // Первый outbound — исходящий по умолчанию: туда Xray отправляет всё, для
+    // чего не нашлось правила. Это блокировка, а не прямой выход, иначе при
+    // любой ошибке трафик ушёл бы мимо VPN с настоящим IP.
+    outbounds.insert(0, json!({"protocol": "blackhole", "tag": "block"}));
+    // Прямой выход нужен только самому Xray — чтобы узнавать адреса серверов.
+    outbounds.insert(1, json!({"protocol": "freedom", "tag": "direct"}));
     rules.insert(0, json!({"type": "field", "inboundTag": ["xray-dns"], "outboundTag": "direct"}));
     // Сначала DNS из подписки, затем наш прямой DNS как запасной.
     let fallback = json!(dns);
@@ -711,7 +680,7 @@ pub fn build_config(
         "info" => "info",
         _ => "warning",
     };
-    let mut cfg = json!({
+    json!({
         "log": {"loglevel": level},
         "dns": {
             "tag": "xray-dns",
@@ -722,25 +691,65 @@ pub fn build_config(
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": rules}
-    });
-    if !balancers.is_empty() {
-        cfg["routing"]["balancers"] = json!(balancers);
+    })
+}
+
+/// Раскладывает сервер на части для запуска. Обычный сервер — одна часть.
+/// Балансировщик провайдера (автовыбор внутри одного конфига) — по части на
+/// каждый его сервер плюс запасной: выбор между ними делает sing-box. Так не
+/// нужны наблюдатели Xray, которые после запуска несколько секунд не знают
+/// живых серверов и в это время отправляют трафик неизвестно куда.
+pub fn expand(v: &Value) -> Vec<Value> {
+    let Some(b) = v.get("balancer").filter(|b| b.is_object() && is_bundle(v)) else {
+        return vec![v.clone()];
+    };
+    let list: Vec<&Value> = v["outbounds"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    let tag_of = |o: &Value| o["tag"].as_str().unwrap_or("").to_string();
+    let is_proxy = |o: &Value| o["protocol"].as_str().map(|p| XRAY_PROTOCOLS.contains(&p)).unwrap_or(false);
+    let sel: Vec<&str> = b["selector"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let mut members: Vec<String> = list
+        .iter()
+        .filter(|o| is_proxy(o) && sel.iter().any(|p| tag_of(o).starts_with(p)))
+        .map(|o| tag_of(o))
+        .collect();
+    // Запасной сервер — последним; прямой выход или блокировка запасным не бывают.
+    if let Some(fb) = b["fallbackTag"].as_str() {
+        if list.iter().any(|o| tag_of(o) == fb && is_proxy(o)) && !members.iter().any(|m| m == fb) {
+            members.push(fb.to_string());
+        }
     }
-    if !observe.is_empty() {
-        let mut o = observatory.unwrap_or_else(|| {
-            json!({"probeURL": "https://www.gstatic.com/generate_204", "probeInterval": "1m", "enableConcurrency": true})
-        });
-        o["subjectSelector"] = json!(observe);
-        cfg["observatory"] = o;
+    if members.is_empty() {
+        if let Some(first) = list.iter().find(|o| is_proxy(o)) {
+            members.push(tag_of(first));
+        }
     }
-    if !burst.is_empty() {
-        let mut o = burst_cfg.unwrap_or_else(|| {
-            json!({"pingConfig": {"destination": "https://www.gstatic.com/generate_204", "interval": "1m", "timeout": "5s", "sampling": 2}})
-        });
-        o["subjectSelector"] = json!(burst);
-        cfg["burstObservatory"] = o;
+    members.iter().map(|m| sub_bundle(v, &list, m)).collect()
+}
+
+/// Связка из одного сервера и того, через что он подключается.
+fn sub_bundle(v: &Value, list: &[&Value], main: &str) -> Value {
+    let tag_of = |o: &Value| o["tag"].as_str().unwrap_or("").to_string();
+    let mut need = vec![main.to_string()];
+    let mut i = 0;
+    while i < need.len() {
+        if let Some(o) = list.iter().find(|o| tag_of(o) == need[i]) {
+            for d in dep_tags(o) {
+                if !need.contains(&d) {
+                    need.push(d);
+                }
+            }
+        }
+        i += 1;
     }
-    cfg
+    let outs: Vec<Value> = list.iter().filter(|o| need.contains(&tag_of(o))).map(|o| (*o).clone()).collect();
+    let mut b = json!({"bundle": true, "main": main, "outbounds": outs});
+    if let Some(d) = v.get("dns") {
+        b["dns"] = d.clone();
+    }
+    b
 }
 
 /// Адрес сервера разрешаем встроенным DNS Xray: запрос уходит из процесса Xray,
@@ -816,8 +825,9 @@ mod tests {
         assert_eq!(c["inbounds"][0]["settings"]["accounts"][0]["pass"], "p");
         assert_eq!(c["inbounds"][0]["port"], 10800);
         assert_eq!(c["routing"]["rules"][1]["outboundTag"], "out-s1");
-        assert_eq!(c["outbounds"][1]["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");
-        assert_eq!(c["outbounds"][1]["streamSettings"]["tlsSettings"]["serverName"], "h.example.com");
+        assert_eq!(c["outbounds"][0]["protocol"], "blackhole");
+        assert_eq!(c["outbounds"][2]["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4");
+        assert_eq!(c["outbounds"][2]["streamSettings"]["tlsSettings"]["serverName"], "h.example.com");
     }
 
     /// Цепочка: трафик идёт в «proxy» (XHTTP), а он подключается через
@@ -856,10 +866,34 @@ mod tests {
                         "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "auto"}]}});
         let (_, b) = outbound_from_config(&cfg).unwrap();
         assert!(is_bundle(&b));
-        let x = build_config(&[XrayEntry { tag: "s2", port: 1001, outbound: &b }], "1.1.1.1", false, "warn", ("u", "p"));
-        assert_eq!(x["routing"]["balancers"][0]["selector"][0], "s2~proxy-");
-        assert_eq!(x["routing"]["rules"][1]["balancerTag"], "s2~auto");
-        assert_eq!(x["observatory"]["subjectSelector"][0], "s2~proxy-");
+        // Автовыбор раскладывается на серверы, прямой выход в них не попадает.
+        let parts = expand(&b);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["main"], "proxy-2");
+        assert_eq!(parts[1]["outbounds"].as_array().unwrap().len(), 1);
+        let x = build_config(&[XrayEntry { tag: "s2~1", port: 1001, outbound: &parts[1] }], "1.1.1.1", false, "warn", ("u", "p"));
+        assert!(x["routing"].get("balancers").is_none());
+        assert!(x.get("observatory").is_none());
+        assert_eq!(x["routing"]["rules"][1]["outboundTag"], "s2~1~proxy-2");
+    }
+
+    /// Запасной сервер балансировщика — только прокси, не прямой выход.
+    #[test]
+    fn xray_balancer_fallback_never_direct() {
+        let cfg = json!({"outbounds": [
+            {"tag": "proxy-1", "protocol": "vless", "settings": {"address": "a.example.com", "port": 443, "id": "u"}},
+            {"tag": "fb", "protocol": "vless", "settings": {"address": "f.example.com", "port": 443, "id": "u"}},
+            {"tag": "direct", "protocol": "freedom"}],
+            "routing": {"balancers": [{"tag": "auto", "selector": ["proxy-"], "fallbackTag": "direct", "strategy": {"type": "leastLoad"}}],
+                        "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "auto"}]}});
+        let (_, b) = outbound_from_config(&cfg).unwrap();
+        let parts = expand(&b);
+        assert_eq!(parts.len(), 1);
+        let x = build_config(&[XrayEntry { tag: "s", port: 1, outbound: &parts[0] }], "1.1.1.1", false, "warn", ("u", "p"));
+        // Исходящий по умолчанию — блокировка.
+        assert_eq!(x["outbounds"][0]["protocol"], "blackhole");
+        let freedom = x["outbounds"].as_array().unwrap().iter().filter(|o| o["protocol"] == "freedom").count();
+        assert_eq!(freedom, 1, "прямой выход только для DNS самого Xray");
     }
 
     /// Без правил Xray отправляет трафик в первый outbound списка.
@@ -883,7 +917,8 @@ mod tests {
                     "servers": ["https://1.1.1.1/dns-query", {"address": "8.8.8.8", "domains": ["geosite:google"]}, "fakedns"]}});
         let (_, b) = outbound_from_config(&cfg).unwrap();
         let x = build_config(&[XrayEntry { tag: "s", port: 1, outbound: &b }], "77.88.8.8", false, "warn", ("u", "p"));
-        assert_eq!(x["outbounds"][0]["tag"], "direct");
+        assert_eq!(x["outbounds"][0]["tag"], "block");
+        assert_eq!(x["outbounds"][1]["tag"], "direct");
         assert_eq!(x["dns"]["hosts"]["nl.example.com"], "5.6.7.8");
         assert!(x["dns"]["hosts"].get("geosite:category-ads-all").is_none());
         assert_eq!(x["dns"]["servers"], json!(["https://1.1.1.1/dns-query", "77.88.8.8"]));
