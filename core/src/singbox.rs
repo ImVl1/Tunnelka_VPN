@@ -368,6 +368,15 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             "interrupt_exist_connections": true
         }),
     );
+    // Российские серверы в общий автовыбор не входят: через них сайты видят
+    // российский IP. Если других нет — входят все.
+    let foreign: Vec<String> = input
+        .servers
+        .iter()
+        .filter(|s| !s.is_domestic() && tags.contains(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    let auto_tags = if foreign.is_empty() { tags.clone() } else { foreign };
     // Общий автовыбор проверяет все серверы подписки (включая части групп).
     // Это нужно, только когда выбран он сам; иначе группа пассивная, чтобы
     // каждое подключение не начиналось с десятков проверочных соединений.
@@ -375,7 +384,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         json!({
             "type": "urltest",
             "tag": TAG_AUTO,
-            "outbounds": tags,
+            "outbounds": auto_tags,
             "url": URL_TEST,
             "interval": "5m",
             "tolerance": 50
@@ -384,8 +393,8 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         json!({
             "type": "selector",
             "tag": TAG_AUTO,
-            "outbounds": tags,
-            "default": tags[0],
+            "outbounds": auto_tags,
+            "default": auto_tags[0],
             "interrupt_exist_connections": false
         })
     };
@@ -576,15 +585,24 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
     if split.ru_direct && !include_mode {
         rules.push(json!({"domain_suffix": FOREIGN_RU, "outbound": TAG_PROXY}));
         rules.push(json!({"domain_suffix": RU_SUFFIXES, "outbound": TAG_DIRECT}));
-        let mut sets = vec![];
         if geosite_ru {
-            sets.push("geosite-ru");
+            rules.push(json!({"rule_set": ["geosite-ru"], "outbound": TAG_DIRECT}));
         }
         if geoip_ru {
-            sets.push("geoip-ru");
-        }
-        if !sets.is_empty() {
-            rules.push(json!({"rule_set": sets, "outbound": TAG_DIRECT}));
+            // По российскому IP напрямую — только если имя сайта неизвестно.
+            // Если браузер получил для зарубежного сайта российский адрес
+            // (например, свой «безопасный DNS» отдал сервер Google в российской
+            // сети), решает имя сайта: зарубежный сайт идёт через VPN, а адрес
+            // там найдёт сам сервер. Иначе сайт увидел бы российский IP.
+            rules.push(json!({
+                "type": "logical",
+                "mode": "and",
+                "rules": [
+                    {"rule_set": ["geoip-ru"]},
+                    {"domain_regex": [".+"], "invert": true}
+                ],
+                "outbound": TAG_DIRECT
+            }));
         }
     }
 

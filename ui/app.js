@@ -134,6 +134,9 @@ function renderHome() {
     sub.textContent = "Нажмите на тоннель, чтобы подключиться";
   }
   $("#stats").hidden = !on || paused;
+  const exit = $("#exit-info");
+  exit.hidden = !(on && !paused && status?.exit_ip);
+  exit.textContent = status?.exit_ip ? `${status.exit_ip}${status.exit_place ? ` · ${status.exit_place}` : ""}` : "";
   const notice = $("#notice");
   notice.hidden = !(on && status?.notice);
   notice.textContent = status?.notice ?? "";

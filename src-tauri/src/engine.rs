@@ -84,6 +84,8 @@ struct Rt {
     paused: bool,
     /// Идёт фоновая проверка интернета после подключения.
     checking: bool,
+    /// Адрес, с которым сайты видят пользователя через VPN: (IP, место).
+    exit: Option<(String, String)>,
     /// Номер подключения: фоновая проверка не трогает более новое подключение.
     gen: u64,
     /// Режим, в котором реально работает подключение.
@@ -116,6 +118,9 @@ pub struct Status {
     pub paused: bool,
     /// Идёт проверка, что через VPN есть интернет.
     pub checking: bool,
+    /// IP, с которым сайты видят пользователя через VPN, и где он находится.
+    pub exit_ip: Option<String>,
+    pub exit_place: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -824,6 +829,8 @@ impl Engine {
             kill_switch_active: killswitch::is_active(&self.paths.data),
             paused: running && rt.paused,
             checking: running && rt.checking,
+            exit_ip: rt.exit.as_ref().filter(|_| running && !rt.paused).map(|e| e.0.clone()),
+            exit_place: rt.exit.as_ref().filter(|_| running && !rt.paused).map(|e| e.1.clone()),
         }
     }
 
@@ -1321,11 +1328,32 @@ impl Engine {
             }
             self.log("[app] сервер не отвечает, ищу рабочий");
             let sub_id = self.rt.lock().unwrap().active_sub.clone().unwrap_or_default();
+            // Российские серверы автоматически не выбираются: через них сайты
+            // видят российский IP (если сам пользователь не выбрал такой сервер).
+            let domestic: std::collections::HashSet<String> = {
+                let st = self.state.lock().unwrap();
+                let current_domestic = st
+                    .selected
+                    .as_ref()
+                    .and_then(|sel| find_selection(&st.subscriptions, sel))
+                    .and_then(|(_, srv)| srv.map(|s| s.is_domestic()))
+                    .unwrap_or(false);
+                if current_domestic {
+                    Default::default()
+                } else {
+                    st.subscriptions
+                        .iter()
+                        .flat_map(|s| s.servers.iter())
+                        .filter(|s| s.is_domestic())
+                        .map(|s| s.id.clone())
+                        .collect()
+                }
+            };
             let best = self
                 .ping(&sub_id)
                 .await
                 .into_iter()
-                .filter(|(_, ms)| *ms > 0)
+                .filter(|(id, ms)| *ms > 0 && !domestic.contains(id))
                 .min_by_key(|(_, ms)| *ms)
                 .map(|(id, _)| id);
             if !same(&self) {
@@ -1346,6 +1374,7 @@ impl Engine {
                     self.refresh_profile();
                     self.log(format!("[app] переключено на «{new}»"));
                     self.rt.lock().unwrap().notice = Some(format!("«{old}» не отвечал — подключено через «{new}»"));
+                    self.check_exit().await;
                 }
                 _ => {
                     self.rt.lock().unwrap().notice = Some("Ни один сервер подписки сейчас не отвечает".into());
@@ -1357,6 +1386,9 @@ impl Engine {
 
         let tun = PLATFORM != Platform::Android && self.rt.lock().unwrap().mode == Mode::Tun;
         if !tun || !settings.tun_fallback || self.internet_works().await || !same(&self) {
+            if same(&self) {
+                self.check_exit().await;
+            }
             done(&self);
             return;
         }
@@ -1428,6 +1460,81 @@ impl Engine {
         proxy_delay(&self.http, &base, &secret, tag).await
     }
 
+    /// Узнаёт, с каким IP сайты видят пользователя через VPN, — чтобы это было
+    /// видно на главном экране. Если IP российский, а выбран зарубежный сервер,
+    /// предупреждает.
+    async fn check_exit(&self) {
+        let include_app = self.state.lock().unwrap().settings.split.app_mode == AppMode::Include;
+        let (gen, include_split) = {
+            let rt = self.rt.lock().unwrap();
+            (rt.gen, PLATFORM == Platform::Windows && rt.mode == Mode::Tun && include_app)
+        };
+        // В режиме «только выбранные программы» само приложение идёт напрямую.
+        if include_split {
+            return;
+        }
+        let mut b = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .user_agent("curl/8.9");
+        b = match self.live_proxy() {
+            Some(p) => match reqwest::Proxy::all(&p) {
+                Ok(px) => b.proxy(px),
+                Err(_) => return,
+            },
+            None => b.no_proxy(),
+        };
+        let Ok(client) = b.build() else { return };
+        let mut found: Option<(String, String, String)> = None;
+        if let Ok(r) = client.get("https://ipinfo.io/json").send().await {
+            if let Ok(v) = r.json::<serde_json::Value>().await {
+                if let Some(ip) = v["ip"].as_str() {
+                    let cc = v["country"].as_str().unwrap_or("").to_string();
+                    found = Some((ip.to_string(), cc, v["city"].as_str().unwrap_or("").to_string()));
+                }
+            }
+        }
+        if found.is_none() {
+            if let Ok(r) = client.get("https://ifconfig.co/json").send().await {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    if let Some(ip) = v["ip"].as_str() {
+                        let cc = v["country_iso"].as_str().unwrap_or("").to_string();
+                        found = Some((ip.to_string(), cc, v["city"].as_str().unwrap_or("").to_string()));
+                    }
+                }
+            }
+        }
+        let Some((ip, cc, city)) = found else { return };
+        let flag: String = cc
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic())
+            .filter_map(|c| char::from_u32(0x1F1E6 + (c.to_ascii_uppercase() as u32 - 'A' as u32)))
+            .collect();
+        let place = [format!("{flag} {cc}").trim().to_string(), city]
+            .into_iter()
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let selected_domestic = {
+            let st = self.state.lock().unwrap();
+            st.selected
+                .as_ref()
+                .and_then(|sel| find_selection(&st.subscriptions, sel))
+                .and_then(|(_, srv)| srv.map(|s| s.is_domestic()))
+                .unwrap_or(false)
+        };
+        let mut rt = self.rt.lock().unwrap();
+        if rt.gen != gen {
+            return;
+        }
+        self.log(format!("[app] сайты видят IP {ip} ({place})"));
+        if cc.eq_ignore_ascii_case("RU") && !selected_domestic {
+            rt.notice = Some(
+                "Сайты видят российский IP: сервер выходит в интернет из России. Выберите сервер в другой стране".into(),
+            );
+        }
+        rt.exit = Some((ip, place));
+    }
+
     /// Выбранный сервер, если у него автовыбор внутри (группа частей).
     fn selected_group(&self) -> Option<String> {
         let selected = self.state.lock().unwrap().selected.clone();
@@ -1490,6 +1597,7 @@ impl Engine {
         rt.active_sub = None;
         rt.started_at = 0;
         rt.checking = false;
+        rt.exit = None;
         rt.gen += 1;
         if PLATFORM != Platform::Android {
             let _ = std::fs::remove_file(&self.paths.config);
@@ -1567,12 +1675,14 @@ impl Engine {
                     self.connect().await?;
                 } else {
                     self.refresh_profile();
-                    if self.rt.lock().unwrap().groups.contains_key(&tag) {
-                        let me = self.clone();
-                        tauri::async_runtime::spawn(async move {
+                    let is_group = self.rt.lock().unwrap().groups.contains_key(&tag);
+                    let me = self.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if is_group {
                             me.tune_group(&tag).await;
-                        });
-                    }
+                        }
+                        me.check_exit().await;
+                    });
                 }
             }
             Some(_) => {

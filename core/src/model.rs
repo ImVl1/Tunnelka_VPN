@@ -32,6 +32,13 @@ impl Server {
         self.outbound.is_some() || self.xray.is_some()
     }
 
+    /// Сервер в России (флаг 🇷🇺 в названии), например для «белых списков».
+    /// Через него сайты видят российский IP, поэтому автоматически он не
+    /// выбирается — только вручную.
+    pub fn is_domestic(&self) -> bool {
+        self.name.contains("🇷🇺")
+    }
+
     /// Сервер работает только через Xray.
     pub fn needs_xray(&self) -> bool {
         self.outbound.is_none() && self.xray.is_some()

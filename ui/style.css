@@ -231,6 +231,10 @@ body.busy .arch .r3 { animation-delay: .36s; }
   .view.active { animation: none; }
 }
 
+.exit-info {
+  margin: 14px 0 0; padding: 6px 13px; border-radius: 999px; font-size: 13px; color: var(--muted);
+  background: rgba(255, 255, 255, .04); border: 1px solid var(--line); font-variant-numeric: tabular-nums;
+}
 .notice {
   margin: 16px 0 0; max-width: 60ch; padding: 10px 14px; border-radius: var(--r-s);
   background: rgba(251, 191, 36, .08); border: 1px solid rgba(251, 191, 36, .25); color: #fcd34d; font-size: 13px;
