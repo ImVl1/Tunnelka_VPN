@@ -15,7 +15,7 @@ class MainActivity : TauriActivity() {
       navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
     )
     super.onCreate(savedInstanceState)
-    window.decorView.setBackgroundColor(Color.parseColor("#13202a"))
+    window.decorView.setBackgroundColor(Color.parseColor("#070708"))
     // Интерфейс не должен заходить под строку состояния, вырез камеры и
     // панель навигации; клавиатура тоже сдвигает содержимое.
     val content = findViewById<android.view.View>(android.R.id.content)

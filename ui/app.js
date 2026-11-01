@@ -343,7 +343,7 @@ $("#add-btn").onclick = async () => {
 
 $("#paste-btn").onclick = async () => {
   try {
-    $("#add-input").value = await navigator.clipboard.readText();
+    $("#add-input").value = isAndroid() ? await invoke("read_clipboard") : await navigator.clipboard.readText();
     $("#add-btn").click();
   } catch {
     toast("Не удалось прочитать буфер обмена — вставьте ссылку вручную (Ctrl+V)", true);
@@ -524,6 +524,7 @@ async function loadLogs() {
   box.textContent = l.join("\n") || "Журнал пуст. Здесь появятся сообщения ядра после подключения.";
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
+$$("[data-link]").forEach((b) => (b.onclick = () => openUrl(b.dataset.link)));
 $("#logs-clear").onclick = async () => { await invoke("clear_logs"); loadLogs(); };
 
 // ---------------------------------------------------------------------------

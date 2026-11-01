@@ -41,6 +41,12 @@
     .logo img { width: 30px; height: 30px; }
     header nav { display: flex; gap: 26px; margin-left: auto; font-size: 14px; color: var(--muted); }
     header nav a:hover { color: var(--text); }
+    .support-btn {
+      padding: 7px 14px; border-radius: 999px; font-size: 13.5px; font-weight: 550;
+      border: 1px solid rgba(255,164,92,.45); background: linear-gradient(100deg, rgba(255,164,92,.14), rgba(181,131,248,.12));
+      box-shadow: 0 0 24px -8px rgba(255,164,92,.6);
+    }
+    .support-btn:hover { background: linear-gradient(100deg, rgba(255,164,92,.24), rgba(181,131,248,.2)); }
     .lang { display: inline-flex; padding: 3px; border: 1px solid var(--line-2); border-radius: 999px; background: var(--card); }
     .lang button { border: 0; background: none; color: var(--muted); font: 600 12.5px Inter, sans-serif; padding: 5px 11px; border-radius: 999px; cursor: pointer; }
     .lang button.on { background: #fafafa; color: #0a0a0b; }
@@ -134,7 +140,7 @@
 
     @media (max-width: 860px) {
       header nav { display: none; }
-      .lang { margin-left: auto; }
+      .support-btn { margin-left: auto; }
       .bento { grid-template-columns: 1fr; }
       .card.wide { grid-column: auto; }
       .shots { grid-template-columns: 1fr; }
@@ -160,6 +166,7 @@
         <a href="#screens" data-t="navScreens">Screenshots</a>
         <a id="repo-link" href="#" data-t="navSource">Source code</a>
       </nav>
+      <a class="support-btn" href="https://imvl1.github.io/donation/" data-t="support">Support</a>
       <div class="lang" role="group" aria-label="Language">
         <button data-lang="en">EN</button><button data-lang="ru">RU</button>
       </div>
@@ -266,14 +273,14 @@
 
     <footer>
       <span data-t="foot">Tunnelka is free and open source (MIT). Built on sing-box and Xray-core.</span>
-      <span style="display:flex;gap:20px"><a id="repo-link2" href="#" data-t="navSource">Source code</a><a id="all-releases" href="#" data-t="allReleases">All releases</a></span>
+      <span style="display:flex;gap:20px"><a id="repo-link2" href="#" data-t="navSource">Source code</a><a id="all-releases" href="#" data-t="allReleases">All releases</a><a href="https://imvl1.github.io/donation/" data-t="support">Support</a></span>
     </footer>
   </div>
 
   <script>
     const T = {
       en: {
-        navFeatures: "Features", navScreens: "Screenshots", navSource: "Source code",
+        support: "♥ Support", navFeatures: "Features", navScreens: "Screenshots", navSource: "Source code",
         badge: "Open source · Free", h1a: "Your VPN subscription,", h1b: "on every device",
         lead: "Paste a subscription link from your provider's bot or dashboard and connect on Windows and Android. VLESS REALITY, XHTTP, Hysteria2 and more.",
         dlWin: "Download for Windows", dlAndroid: "Android APK",
@@ -292,7 +299,7 @@
         title: "Tunnelka — VPN client for Windows and Android",
       },
       ru: {
-        navFeatures: "Возможности", navScreens: "Скриншоты", navSource: "Исходный код",
+        support: "♥ Поддержать", navFeatures: "Возможности", navScreens: "Скриншоты", navSource: "Исходный код",
         badge: "Открытый код · Бесплатно", h1a: "Ваша VPN-подписка", h1b: "на всех устройствах",
         lead: "Вставьте ссылку на подписку из бота или личного кабинета и подключайтесь на Windows и Android. VLESS REALITY, XHTTP, Hysteria2 и другие протоколы.",
         dlWin: "Скачать для Windows", dlAndroid: "APK для Android",

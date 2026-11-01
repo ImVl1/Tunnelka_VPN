@@ -157,6 +157,22 @@ pub fn open_battery_settings() -> Result<(), String> {
     Err("только для Android".into())
 }
 
+/// Текст из буфера обмена (Android).
+pub fn read_clipboard() -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default)]
+            text: String,
+        }
+        let r: R = imp::call("readClipboard", ())?;
+        return Ok(r.text);
+    }
+    #[cfg(not(target_os = "android"))]
+    Err("только для Android".into())
+}
+
 /// Открывает настройки уведомлений приложения.
 pub fn open_notification_settings() -> Result<(), String> {
     #[cfg(target_os = "android")]

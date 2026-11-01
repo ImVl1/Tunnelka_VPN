@@ -145,6 +145,14 @@ async fn open_notification_settings() -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Буфер обмена на Android (в WebView чтение из страницы запрещено).
+#[tauri::command]
+async fn read_clipboard() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(tauri_plugin_tunnelka_vpn::read_clipboard)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("tg://")) {
@@ -334,6 +342,7 @@ pub fn run() {
             battery_status,
             open_battery_settings,
             open_notification_settings,
+            read_clipboard,
             open_url
         ])
         .build(tauri::generate_context!())

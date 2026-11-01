@@ -186,6 +186,21 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         }.start()
     }
 
+    /** Текст из буфера обмена: WebView на Android не даёт читать его из страницы. */
+    @Command
+    fun readClipboard(invoke: Invoke) {
+        activity.runOnUiThread {
+            val cm = activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val clip = cm.primaryClip
+            val text = if (clip != null && clip.itemCount > 0) {
+                clip.getItemAt(0).coerceToText(activity)?.toString() ?: ""
+            } else ""
+            val r = JSObject()
+            r.put("text", text)
+            invoke.resolve(r)
+        }
+    }
+
     @Command
     fun openVpnSettings(invoke: Invoke) {
         val intent = Intent(Settings.ACTION_VPN_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
