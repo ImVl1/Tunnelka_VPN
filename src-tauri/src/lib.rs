@@ -92,6 +92,11 @@ async fn ping(e: E<'_>, sub_id: String) -> Result<HashMap<String, i64>, String> 
 }
 
 #[tauri::command]
+fn ping_progress(e: E<'_>) -> HashMap<String, i64> {
+    e.ping_progress()
+}
+
+#[tauri::command]
 async fn traffic(e: E<'_>) -> Result<Option<Traffic>, String> {
     Ok(e.traffic().await)
 }
@@ -141,6 +146,21 @@ async fn open_battery_settings() -> Result<(), String> {
 #[tauri::command]
 async fn open_notification_settings() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(tauri_plugin_tunnelka_vpn::open_notification_settings)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Окно «Поделиться» на Android.
+#[tauri::command]
+async fn share_text(text: String, title: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || tauri_plugin_tunnelka_vpn::share_text(&text, &title))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn scan_qr() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(tauri_plugin_tunnelka_vpn::scan_qr)
         .await
         .map_err(|e| e.to_string())?
 }
@@ -343,6 +363,9 @@ pub fn run() {
             open_battery_settings,
             open_notification_settings,
             read_clipboard,
+            share_text,
+            scan_qr,
+            ping_progress,
             open_url
         ])
         .build(tauri::generate_context!())

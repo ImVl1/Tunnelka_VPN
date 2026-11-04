@@ -29,6 +29,12 @@ class StartArgs {
     var notify: Boolean = true
 }
 
+@InvokeArg
+class ShareArgs {
+    var text: String = ""
+    var title: String = ""
+}
+
 @TauriPlugin
 class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 
@@ -198,6 +204,50 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
             val r = JSObject()
             r.put("text", text)
             invoke.resolve(r)
+        }
+    }
+
+    /** Системное окно «Поделиться» с текстом (ссылкой на подписку). */
+    @Command
+    fun shareText(invoke: Invoke) {
+        val args = invoke.parseArgs(ShareArgs::class.java)
+        activity.runOnUiThread {
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, args.text)
+                if (args.title.isNotEmpty()) putExtra(Intent.EXTRA_SUBJECT, args.title)
+            }
+            activity.startActivity(Intent.createChooser(send, args.title.ifEmpty { "Поделиться" }))
+            invoke.resolve(JSObject())
+        }
+    }
+
+    /** Сканирует QR-код камерой (сканер Google Play services). */
+    @Command
+    fun scanQr(invoke: Invoke) {
+        activity.runOnUiThread {
+            try {
+                val options = com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions.Builder()
+                    .setBarcodeFormats(com.google.mlkit.vision.barcode.common.Barcode.FORMAT_QR_CODE)
+                    .build()
+                com.google.mlkit.vision.codescanner.GmsBarcodeScanning.getClient(activity, options)
+                    .startScan()
+                    .addOnSuccessListener { code ->
+                        val r = JSObject()
+                        r.put("text", code.rawValue ?: "")
+                        invoke.resolve(r)
+                    }
+                    .addOnCanceledListener {
+                        val r = JSObject()
+                        r.put("text", "")
+                        invoke.resolve(r)
+                    }
+                    .addOnFailureListener { e ->
+                        invoke.reject("сканер QR-кодов недоступен: ${e.message ?: e}. Нужны сервисы Google Play")
+                    }
+            } catch (e: Throwable) {
+                invoke.reject("сканер QR-кодов недоступен: ${e.message ?: e}")
+            }
         }
     }
 

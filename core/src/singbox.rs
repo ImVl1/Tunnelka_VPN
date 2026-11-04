@@ -28,9 +28,13 @@ const FOREIGN_RU: &[&str] = &["google.ru", "youtube.ru", "googleusercontent.ru",
 
 pub struct BuildInput<'a> {
     pub settings: &'a Settings,
-    /// Серверы одной подписки (только пригодные к использованию).
+    /// Серверы всех подписок (только пригодные к использованию): так можно
+    /// переключаться между любыми серверами без переподключения.
     pub servers: Vec<&'a Server>,
-    /// `auto` или id сервера, выбранный по умолчанию в селекторе.
+    /// Автовыбор отдельных подписок: тег группы → id её серверов.
+    /// Общий автовыбор (`auto`) — по всем серверам.
+    pub autos: Vec<(String, Vec<String>)>,
+    /// `auto`, тег автовыбора подписки или id сервера, выбранный по умолчанию.
     pub default: String,
     /// Папка с файлами .srs. None — наборы правил не используются.
     pub ruleset_dir: Option<&'a Path>,
@@ -65,6 +69,10 @@ pub struct Built {
     /// Серверы с автовыбором внутри (балансировщик провайдера): id сервера →
     /// теги его частей. Пинг такого сервера — лучший из пингов частей.
     pub groups: std::collections::HashMap<String, Vec<String>>,
+    /// Конфиг для «белого интернета»: весь трафик идёт через сервер.
+    pub domestic: bool,
+    /// Всё, что можно выбрать без переподключения: серверы и группы автовыбора.
+    pub tags: Vec<String>,
 }
 
 /// Через какое ядро пойдёт сервер.
@@ -291,7 +299,12 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
     let mut xray_entries: Vec<(String, u16, Value)> = vec![];
     let mut xray_hosts: Vec<String> = vec![];
     let mut groups = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     for s in &input.servers {
+        // Один и тот же сервер может быть в нескольких подписках.
+        if !seen.insert(s.id.clone()) {
+            continue;
+        }
         let ob = if uses_xray(s, st) {
             if input.xray_process.is_none() {
                 if s.id == input.default {
@@ -351,12 +364,36 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
     if tags.is_empty() {
         return Err("в выбранной подписке нет серверов, которые можно запустить".into());
     }
-    let default = if input.default == TAG_AUTO || tags.contains(&input.default) {
+    // Российские серверы в автовыбор не входят: через них сайты видят
+    // российский IP. Если других нет — входят все.
+    let auto_members = |ids: &[String]| -> Vec<String> {
+        let ok: Vec<&Server> = input.servers.iter().copied().filter(|s| ids.contains(&s.id) && tags.contains(&s.id)).collect();
+        let foreign: Vec<&Server> = ok.iter().copied().filter(|s| !s.is_domestic()).collect();
+        let pick = if foreign.is_empty() { ok } else { foreign };
+        let mut out: Vec<String> = vec![];
+        for s in pick {
+            if !out.contains(&s.id) {
+                out.push(s.id.clone());
+            }
+        }
+        out
+    };
+    let autos: Vec<(String, Vec<String>)> = input
+        .autos
+        .iter()
+        .map(|(tag, ids)| (tag.clone(), auto_members(ids)))
+        .filter(|(_, m)| !m.is_empty())
+        .collect();
+    let default = if input.default == TAG_AUTO
+        || tags.contains(&input.default)
+        || autos.iter().any(|(t, _)| *t == input.default)
+    {
         input.default.clone()
     } else {
         TAG_AUTO.to_string()
     };
     let mut selector_list = vec![TAG_AUTO.to_string()];
+    selector_list.extend(autos.iter().map(|(t, _)| t.clone()));
     selector_list.extend(tags.iter().cloned());
     outbounds.insert(
         0,
@@ -368,44 +405,63 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             "interrupt_exist_connections": true
         }),
     );
-    // Российские серверы в общий автовыбор не входят: через них сайты видят
-    // российский IP. Если других нет — входят все.
-    let foreign: Vec<String> = input
-        .servers
-        .iter()
-        .filter(|s| !s.is_domestic() && tags.contains(&s.id))
-        .map(|s| s.id.clone())
-        .collect();
-    let auto_tags = if foreign.is_empty() { tags.clone() } else { foreign };
-    // Общий автовыбор проверяет все серверы подписки (включая части групп).
-    // Это нужно, только когда выбран он сам; иначе группа пассивная, чтобы
-    // каждое подключение не начиналось с десятков проверочных соединений.
-    let auto = if default == TAG_AUTO {
-        json!({
-            "type": "urltest",
-            "tag": TAG_AUTO,
-            "outbounds": auto_tags,
-            "url": URL_TEST,
-            "interval": "5m",
-            "tolerance": 50
-        })
-    } else {
-        json!({
-            "type": "selector",
-            "tag": TAG_AUTO,
-            "outbounds": auto_tags,
-            "default": auto_tags[0],
-            "interrupt_exist_connections": false
-        })
+    // Автовыбор проверяет свои серверы (включая части групп), только когда
+    // выбран он сам; иначе группа пассивная, чтобы каждое подключение не
+    // начиналось с десятков проверочных соединений. Если выбранный сервер
+    // перестал отвечать, приложение само запускает проверку группы.
+    let auto_group = |tag: &str, members: &[String]| {
+        if default == tag {
+            json!({
+                "type": "urltest",
+                "tag": tag,
+                "outbounds": members,
+                "url": URL_TEST,
+                "interval": "5m",
+                "tolerance": 50
+            })
+        } else {
+            json!({
+                "type": "selector",
+                "tag": tag,
+                "outbounds": members,
+                "default": members[0],
+                "interrupt_exist_connections": false
+            })
+        }
     };
-    outbounds.insert(1, auto);
+    let all_ids: Vec<String> = tags.clone();
+    let mut auto_obs = vec![auto_group(TAG_AUTO, &auto_members(&all_ids))];
+    for (tag, members) in &autos {
+        auto_obs.push(auto_group(tag, members));
+    }
+    for (i, ob) in auto_obs.into_iter().enumerate() {
+        outbounds.insert(1 + i, ob);
+    }
+
+    // «Белый интернет»: выбран российский сервер. Когда оператор оставляет
+    // доступ только к сайтам из белого списка, напрямую открываются лишь они,
+    // поэтому весь трафик, включая российские сайты, идёт через сервер.
+    let domestic_mode = {
+        let ids: Vec<String> = if default == TAG_AUTO {
+            auto_members(&all_ids)
+        } else if let Some((_, m)) = autos.iter().find(|(t, _)| *t == default) {
+            m.clone()
+        } else {
+            vec![default.clone()]
+        };
+        !ids.is_empty()
+            && ids
+                .iter()
+                .all(|id| input.servers.iter().any(|s| s.id == *id && s.is_domestic()))
+    };
+    let ru_direct = split.ru_direct && !domestic_mode;
     outbounds.push(json!({"type": "direct", "tag": TAG_DIRECT}));
 
     // ---- наборы правил ----
     let mut rule_sets = vec![];
     let mut geosite_ru = false;
     let mut geoip_ru = false;
-    if split.ru_direct {
+    if ru_direct {
         if let Some(dir) = input.ruleset_dir {
             let (gs, gi) = if android {
                 (RULESET_GEOSITE_RU_ANDROID, RULESET_GEOIP_RU_ANDROID)
@@ -490,7 +546,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         );
         dns_rules.push(Value::Object(r));
     }
-    if split.ru_direct && !include_mode {
+    if ru_direct && !include_mode {
         dns_rules.push(json!({"domain_suffix": FOREIGN_RU, "server": "dns-remote"}));
         dns_rules.push(json!({"domain_suffix": RU_SUFFIXES, "server": "dns-direct"}));
         if geosite_ru {
@@ -582,7 +638,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         );
         rules.push(Value::Object(r));
     }
-    if split.ru_direct && !include_mode {
+    if ru_direct && !include_mode {
         rules.push(json!({"domain_suffix": FOREIGN_RU, "outbound": TAG_PROXY}));
         rules.push(json!({"domain_suffix": RU_SUFFIXES, "outbound": TAG_DIRECT}));
         if geosite_ru {
@@ -664,7 +720,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         "route": route,
         "experimental": experimental
     });
-    Ok(Built { singbox, xray: xray_cfg, groups })
+    Ok(Built { singbox, xray: xray_cfg, groups, domestic: domestic_mode, tags: selector_list })
 }
 
 #[cfg(test)]
@@ -699,6 +755,7 @@ mod tests {
         BuildInput {
             settings: st,
             servers: s.iter().collect(),
+            autos: vec![],
             default: default.into(),
             ruleset_dir: None,
             xray_process: Some("xray.exe"),

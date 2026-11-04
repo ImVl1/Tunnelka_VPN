@@ -25,7 +25,7 @@
 
 ## Features
 
-**Subscriptions.** Paste the link from your provider's bot or dashboard: Marzban, Remnawave, 3x-ui, Hiddify and other panels work out of the box. Tunnelka shows remaining traffic, the expiry date and provider announcements, and refreshes subscriptions automatically once a day after launch. Plain and base64 link lists and sing-box / Xray JSON configs are supported. Individual servers can be added as links.
+**Subscriptions.** Paste the link from your provider's bot or dashboard: Marzban, Remnawave, 3x-ui, Hiddify and other panels work out of the box. Tunnelka shows remaining traffic, the expiry date and provider announcements, and refreshes subscriptions automatically once a day after launch. Plain and base64 link lists and sing-box / Xray JSON configs are supported. Individual servers can be added as links. On a phone, subscriptions can be added by scanning a QR code, and shared as a link or QR code.
 
 **Protocols.** VLESS (REALITY, TLS, XTLS Vision, XHTTP, WebSocket, gRPC, HTTPUpgrade), VMess, Trojan, Shadowsocks and Shadowsocks 2022, Hysteria2 with port hopping, TUIC, SOCKS5 and HTTP(S).
 
@@ -35,8 +35,9 @@
 - Russian sites and IP addresses can be sent direct with a single switch.
 
 **Connection.**
-- Automatic selection of the lowest-latency server and switching between servers without dropping the connection.
-- If the selected server stops answering, Tunnelka moves to a working one.
+- Automatic selection of the lowest-latency server — per subscription, plus "Auto+" across all subscriptions. Switching between servers without dropping the connection.
+- While the VPN is on, Tunnelka keeps checking the connection. If a server goes down, it switches to a similar working one: same connection type first, then same country (the order is configurable). On Android this works even when the app is closed.
+- "Whitelist internet": all traffic goes through Russian servers, so they keep working when a mobile carrier only allows whitelisted sites.
 - Windows: TUN mode (all traffic on the computer) or system proxy. If your ISP breaks TUN, the app falls back to the system proxy on its own.
 - Android: system VPN for all apps, a Quick Settings tile, Pause and Disconnect buttons in the notification, and Always-on VPN support. The VPN keeps running after the app is swiped away from recents.
 

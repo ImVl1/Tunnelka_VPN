@@ -29,5 +29,8 @@ kotlin {
 dependencies {
     implementation("androidx.core:core-ktx:1.9.0")
     implementation("androidx.appcompat:appcompat:1.6.0")
+    // Сканер QR-кодов из Google Play services: без разрешения на камеру и
+    // собственного экрана, модуль скачивается системой при первом запуске.
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     implementation(project(":tauri-android"))
 }

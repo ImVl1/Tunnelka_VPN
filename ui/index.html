@@ -26,6 +26,10 @@
       <symbol id="i-log" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" /><path d="M14 3v6h6" /><path d="M8 13h8" /><path d="M8 17h5" /></symbol>
       <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M7 17 17 7" /><path d="M8 7h9v9" /></symbol>
       <symbol id="i-right" viewBox="0 0 24 24"><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></symbol>
+      <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2" /><circle cx="12" cy="12" r="1.2" /><circle cx="19" cy="12" r="1.2" /></symbol>
+      <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3" /><path d="M16 4h3a1 1 0 0 1 1 1v3" /><path d="M20 16v3a1 1 0 0 1-1 1h-3" /><path d="M8 20H5a1 1 0 0 1-1-1v-3" /><path d="M4 12h16" /></symbol>
+      <symbol id="i-up" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6" /></symbol>
+      <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></symbol>
     </defs>
   </svg>
 
@@ -98,8 +102,10 @@
         <div class="row">
           <button class="btn primary" id="add-btn">Добавить <svg><use href="#i-right" /></svg></button>
           <button class="btn" id="paste-btn">Вставить из буфера</button>
+          <button class="btn android-only-inline" id="scan-btn"><svg><use href="#i-scan" /></svg>Сканировать QR</button>
         </div>
       </div>
+      <div class="list auto-all" id="auto-all"></div>
       <div class="pills tabs" id="sub-tabs"></div>
       <div id="sub-card"></div>
       <div class="list" id="server-list"></div>
@@ -174,7 +180,8 @@
 
       <div class="card block">
         <h3>Защита</h3>
-        <label class="switch"><input type="checkbox" id="s-autoswitch" /><span>Если сервер не отвечает — переключаться на рабочий <small>После подключения приложение проверяет сервер. Если он не отвечает, выбирается самый быстрый рабочий сервер той же подписки.</small></span></label>
+        <label class="switch"><input type="checkbox" id="s-autoswitch" /><span>Если сервер перестал отвечать — переключаться на похожий <small>Пока VPN включён, приложение каждые 30 секунд проверяет, что через сервер есть интернет. Если сервер пропал, выбирается похожий рабочий — в порядке, который можно настроить ниже.</small></span></label>
+        <button class="setting-link" id="order-open" type="button"><span>Как подбирать замену<small id="order-summary"></small></span><svg><use href="#i-right" /></svg></button>
         <div class="desktop-only">
           <label class="switch"><input type="checkbox" id="s-killswitch" /><span>Kill switch <small>Пока VPN включён, брандмауэр Windows пропускает в интернет только трафик через VPN. Если ядро упадёт, программы не смогут выйти в сеть напрямую. Кнопка «Отключить» снимает блокировку.</small></span></label>
           <label class="switch"><input type="checkbox" id="s-fallback" /><span>Если в режиме TUN нет интернета — переключаться на системный прокси</span></label>
@@ -246,7 +253,49 @@
     </form>
   </dialog>
 
+  <!-- Меню подписки -->
+  <dialog id="sub-menu" class="sheet">
+    <form method="dialog">
+      <h3 id="sub-menu-title"></h3>
+      <div class="menu" id="sub-menu-list"></div>
+      <div class="row end"><button class="btn" value="close">Закрыть</button></div>
+    </form>
+  </dialog>
+
+  <!-- QR-код подписки -->
+  <dialog id="qr-dialog" class="sheet">
+    <form method="dialog">
+      <h3 id="qr-title"></h3>
+      <div class="qr" id="qr-box"></div>
+      <p class="hint">Отсканируйте код в Tunnelka на другом устройстве или в другом VPN-клиенте. По этому коду можно пользоваться вашей подпиской — не показывайте его посторонним.</p>
+      <div class="row end"><button class="btn" type="button" id="qr-copy">Скопировать ссылку</button><button class="btn primary" value="close">Готово</button></div>
+    </form>
+  </dialog>
+
+  <!-- Переименование и подтверждения -->
+  <dialog id="ask-dialog" class="sheet">
+    <form method="dialog">
+      <h3 id="ask-title"></h3>
+      <p class="hint" id="ask-text"></p>
+      <input id="ask-input" />
+      <div class="row end"><button class="btn" value="cancel">Отмена</button><button class="btn primary" value="ok" id="ask-ok">OK</button></div>
+    </form>
+  </dialog>
+
+  <!-- Порядок подбора замены -->
+  <dialog id="order-dialog" class="sheet">
+    <form method="dialog">
+      <h3>Как подбирать замену</h3>
+      <p class="hint">Если выбранный сервер перестал отвечать, Tunnelka проверяет серверы по шагам сверху вниз. На каждом шаге выбирается самый быстрый рабочий сервер; если на шаге не ответил ни один — переход к следующему. Порядок меняется стрелками, ненужный шаг можно выключить.</p>
+      <div class="order" id="order-list"></div>
+      <div class="order-last">Остальные серверы — от быстрых к медленным</div>
+      <p class="hint">Российские серверы («белый интернет») меняются только на российские, зарубежные — только на зарубежные.</p>
+      <div class="row end"><button class="btn" value="cancel">Отмена</button><button class="btn primary" value="ok" id="order-save">Сохранить</button></div>
+    </form>
+  </dialog>
+
   <div id="toast" role="status" aria-live="polite"></div>
+  <script src="vendor/qrcode.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -39,6 +39,34 @@ impl Server {
         self.name.contains("🇷🇺")
     }
 
+    /// Страна по флагу в названии: «DE», «NL». None — флага нет.
+    pub fn country(&self) -> Option<String> {
+        let mut letters = String::new();
+        for c in self.name.chars() {
+            let u = c as u32;
+            if (0x1F1E6..=0x1F1FF).contains(&u) {
+                letters.push(char::from_u32(u - 0x1F1E6 + 'A' as u32).unwrap_or('?'));
+                if letters.len() == 2 {
+                    return Some(letters);
+                }
+            } else {
+                letters.clear();
+            }
+        }
+        None
+    }
+
+    /// Тип подключения для подбора замены: протокол и транспорт
+    /// (`vless xhttp`, `vless tcp`, `hysteria2`).
+    pub fn kind(&self) -> String {
+        let net = self.transport.split('·').next().unwrap_or("").trim().to_lowercase();
+        if net.is_empty() {
+            self.protocol.to_lowercase()
+        } else {
+            format!("{} {net}", self.protocol.to_lowercase())
+        }
+    }
+
     /// Сервер работает только через Xray.
     pub fn needs_xray(&self) -> bool {
         self.outbound.is_none() && self.xray.is_some()
@@ -231,10 +259,15 @@ pub struct Settings {
     /// Подключаться при запуске приложения.
     #[serde(default)]
     pub auto_connect: bool,
-    /// Если выбранный сервер не отвечает после подключения — переключиться на
-    /// самый быстрый рабочий сервер той же подписки.
+    /// Если выбранный сервер перестал отвечать — переключиться на похожий
+    /// рабочий сервер (см. `switch_order`).
     #[serde(default = "yes")]
     pub auto_switch: bool,
+    /// Порядок подбора замены неработающему серверу: `type` — такой же тип
+    /// подключения, `country` — та же страна, `subscription` — та же подписка.
+    /// Остальные серверы идут после, от быстрых к медленным.
+    #[serde(default = "switch_order")]
+    pub switch_order: Vec<String>,
     /// Если в режиме TUN нет интернета — переключиться на системный прокси.
     #[serde(default = "yes")]
     pub tun_fallback: bool,
@@ -252,6 +285,9 @@ pub struct Settings {
     pub log_level: String,
 }
 
+fn switch_order() -> Vec<String> {
+    vec!["type".into(), "country".into()]
+}
 fn p_lan() -> u16 {
     2080
 }
@@ -306,15 +342,30 @@ pub enum Selection {
     Server(String),
     /// Автовыбор по пингу внутри подписки.
     Auto(String),
+    /// «Автовыбор+»: лучший сервер из всех подписок.
+    AutoAll,
 }
 
 impl Selection {
     pub const AUTO_PREFIX: &'static str = "auto:";
+    pub const AUTO_ALL: &'static str = "auto+";
 
     pub fn parse(s: &str) -> Selection {
+        if s == Self::AUTO_ALL {
+            return Selection::AutoAll;
+        }
         match s.strip_prefix(Self::AUTO_PREFIX) {
             Some(sub) => Selection::Auto(sub.to_string()),
             None => Selection::Server(s.to_string()),
         }
     }
+
+    pub fn is_auto(&self) -> bool {
+        !matches!(self, Selection::Server(_))
+    }
+}
+
+/// Тег группы автовыбора подписки в sing-box.
+pub fn auto_tag(sub_id: &str) -> String {
+    format!("auto-{sub_id}")
 }

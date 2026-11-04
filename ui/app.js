@@ -67,13 +67,12 @@ function openUrl(url) {
 }
 
 function needsXray() {
-  const sub = data?.subscriptions.find((s) => s.id === selectedSubId());
-  return !!sub?.servers.some((x) => x.xray && !x.outbound);
+  return !!data?.subscriptions.some((sub) => sub.servers.some((x) => x.xray && !x.outbound));
 }
 
 function selectedSubId() {
   const sel = data?.selected;
-  if (!sel) return null;
+  if (!sel || sel === "auto+") return null;
   if (sel.startsWith("auto:")) return sel.slice(5);
   return data.subscriptions.find((s) => s.servers.some((x) => x.id === sel))?.id ?? null;
 }
@@ -209,19 +208,39 @@ function renderSideOnly() {
 // серверы и подписки
 // ---------------------------------------------------------------------------
 
-function pingCell(s) {
-  if (s.id in pings) {
-    const v = pings[s.id];
-    if (v === -1) return `<span class="ping">UDP</span>`;
-    if (!v) return `<span class="ping bad">нет ответа</span>`;
-    const cls = v < 200 ? "good" : v < 500 ? "mid" : "bad";
-    return `<span class="ping ${cls}">${v} мс</span>`;
+function pingHtml(id) {
+  if (id in pings) {
+    const v = pings[id];
+    if (v === -1) return { cls: "", text: "UDP" };
+    if (!v) return { cls: "bad", text: "нет ответа" };
+    return { cls: v < 200 ? "good" : v < 500 ? "mid" : "bad", text: `${v} мс` };
   }
-  return `<span class="ping"></span>`;
+  return { cls: "", text: pingBusy.has(id) ? "…" : "" };
 }
+function pingCell(s) {
+  const p = pingHtml(s.id);
+  return `<span class="ping ${p.cls}" data-ping="${esc(s.id)}">${esc(p.text)}</span>`;
+}
+/** Обновляет только ячейки пинга, не перерисовывая список. */
+function paintPings() {
+  $$("[data-ping]").forEach((el) => {
+    const p = pingHtml(el.dataset.ping);
+    el.className = `ping ${p.cls}`;
+    el.textContent = p.text;
+  });
+}
+
+const usableCount = () => data.subscriptions.filter((s) => s.servers.some((x) => x.outbound || x.xray)).length;
 
 function renderServers() {
   const subs = data.subscriptions;
+  // «Автовыбор+» — поверх всех подписок.
+  $("#auto-all").innerHTML = usableCount() > 1 ? `
+      <div class="srv plus ${data.selected === "auto+" ? "sel" : ""}" data-id="auto+">
+        <span class="dot"></span>
+        <span class="name"><b>Автовыбор+</b><small>лучший сервер из всех подписок</small></span>
+        <span class="proto"></span><span class="ping"></span><span></span>
+      </div>` : "";
   $("#sub-tabs").innerHTML = subs
     .map((s) => `<button data-sub="${esc(s.id)}" class="${s.id === activeSub ? "active" : ""}">${esc(s.name)} <span class="muted">${s.servers.length}</span></button>`)
     .join("");
@@ -248,40 +267,24 @@ function renderServers() {
   }
   if (sub.url && sub.updated_at) meta.push(`обновлена ${new Date(sub.updated_at * 1000).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" })}`);
   const pct = info?.total ? Math.min(100, ((info.upload + info.download) / info.total) * 100) : null;
-  const links = [
-    sub.support_url && `<button class="btn small" data-open="${esc(sub.support_url)}">Поддержка</button>`,
-    sub.web_page_url && `<button class="btn small" data-open="${esc(sub.web_page_url)}">Сайт</button>`,
-  ].filter(Boolean).join("");
   $("#sub-card").innerHTML = `
     <div class="sub-card">
       <div class="meta">${meta.map(esc).map((m) => `<span>${m}</span>`).join("")}</div>
       <div class="sub-actions">
-        ${links}
-        <button class="btn small" id="ping-btn">Проверить пинг</button>
+        <button class="btn small" id="ping-btn" ${pingRunning ? "disabled" : ""}>${pingRunning ? "Проверяю…" : "Проверить пинг"}</button>
         ${sub.url ? `<button class="btn small" id="upd-btn">Обновить</button>` : ""}
-        <button class="btn small" id="ren-btn">Переименовать</button>
-        <button class="btn small" id="del-btn">Удалить</button>
+        <button class="btn small" id="more-btn" aria-label="Ещё"><svg><use href="#i-more" /></svg>Ещё</button>
       </div>
       ${pct !== null ? `<div class="usage"><i class="${pct > 85 ? "high" : ""}" style="width:${pct}%"></i></div>` : ""}
       ${sub.announce ? `<div class="announce">${esc(sub.announce)}</div>` : ""}
       ${sub.last_error ? `<div class="err">Последнее обновление не удалось: ${esc(sub.last_error)}</div>` : ""}
     </div>`;
-  $$("[data-open]").forEach((b) => (b.onclick = () => openUrl(b.dataset.open)));
   $("#ping-btn").onclick = () => runPing(sub.id);
   if ($("#upd-btn")) $("#upd-btn").onclick = async (e) => {
     e.target.disabled = true;
     try { await call("update_subscription", { id: sub.id }, "Подписка обновлена"); } finally { await reload(); }
   };
-  $("#ren-btn").onclick = async () => {
-    const name = prompt("Новое название", sub.name);
-    if (name?.trim()) { await call("rename_subscription", { id: sub.id, name }); await reload(); }
-  };
-  $("#del-btn").onclick = async () => {
-    if (!confirm(`Удалить «${sub.name}»?`)) return;
-    await call("remove_subscription", { id: sub.id }, "Удалено");
-    activeSub = null;
-    await reload();
-  };
+  $("#more-btn").onclick = () => openSubMenu(sub);
 
   // список серверов
   const autoId = `auto:${sub.id}`;
@@ -291,7 +294,7 @@ function renderServers() {
     rows.push(`
       <div class="srv ${data.selected === autoId ? "sel" : ""}" data-id="${esc(autoId)}">
         <span class="dot"></span>
-        <span class="name">Автовыбор<small>лучший сервер по задержке, переключается сам</small></span>
+        <span class="name">Автовыбор<small>лучший сервер этой подписки</small></span>
         <span class="proto"></span><span class="ping"></span><span></span>
       </div>`);
   }
@@ -307,7 +310,7 @@ function renderServers() {
       </div>`);
   }
   $("#server-list").innerHTML = rows.join("") || `<div class="empty">В подписке нет серверов</div>`;
-  $$("#server-list .srv:not(.disabled)").forEach((r) => (r.onclick = async (e) => {
+  $$("#server-list .srv:not(.disabled), #auto-all .srv").forEach((r) => (r.onclick = async (e) => {
     if (e.target.closest("[data-del]")) return;
     status = await call("select_server", { id: r.dataset.id });
     await reload();
@@ -315,14 +318,118 @@ function renderServers() {
   $$("[data-del]").forEach((b) => (b.onclick = async () => { await call("remove_server", { id: b.dataset.del }); await reload(); }));
 }
 
+// Проверка пинга: результаты появляются по мере готовности.
+let pingRunning = false;
+let pingBusy = new Set();
 async function runPing(subId) {
-  const btn = $("#ping-btn");
-  if (btn) { btn.disabled = true; btn.textContent = "Проверяю…"; }
+  if (pingRunning) return;
+  pingRunning = true;
+  const sub = data.subscriptions.find((s) => s.id === subId);
+  pingBusy = new Set((sub?.servers ?? []).map((s) => s.id));
+  for (const id of pingBusy) delete pings[id];
+  if (view === "servers") renderServers();
+  const timer = setInterval(async () => {
+    try { Object.assign(pings, await invoke("ping_progress")); paintPings(); } catch { /* */ }
+  }, 400);
   try {
     Object.assign(pings, await call("ping", { subId }));
   } finally {
+    clearInterval(timer);
+    pingRunning = false;
+    pingBusy = new Set();
     if (view === "servers") renderServers();
   }
+}
+
+// ---- меню подписки ----
+
+function shareLabel() { return isAndroid() ? "Поделиться ссылкой" : "Скопировать ссылку"; }
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return toast("Ссылка скопирована"); } catch { /* ниже — запасной способ */ }
+  const t = document.createElement("textarea");
+  t.value = text;
+  document.body.append(t);
+  t.select();
+  const ok = document.execCommand("copy");
+  t.remove();
+  toast(ok ? "Ссылка скопирована" : "Не удалось скопировать ссылку", !ok);
+}
+
+async function shareLink(sub) {
+  if (isAndroid()) {
+    try { await invoke("share_text", { text: sub.url, title: sub.name }); return; } catch { /* ниже — копирование */ }
+  }
+  copyText(sub.url);
+}
+
+function showQr(sub) {
+  try {
+    const q = qrcode(0, "M");
+    q.addData(sub.url, "Byte");
+    q.make();
+    $("#qr-box").innerHTML = q.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
+  } catch {
+    return toast("Ссылка слишком длинная для QR-кода", true);
+  }
+  $("#qr-title").textContent = sub.name;
+  $("#qr-copy").onclick = () => copyText(sub.url);
+  $("#qr-dialog").showModal();
+}
+
+/** Окно с вопросом: строка ввода (rename) или подтверждение. */
+function ask({ title, text = "", value = null, ok = "OK", danger = false }) {
+  return new Promise((resolve) => {
+    const d = $("#ask-dialog");
+    d.dataset.mode = value === null ? "confirm" : "input";
+    $("#ask-title").textContent = title;
+    $("#ask-text").textContent = text;
+    $("#ask-text").hidden = !text;
+    $("#ask-input").value = value ?? "";
+    $("#ask-ok").textContent = ok;
+    $("#ask-ok").classList.toggle("danger", danger);
+    d.onclose = () => resolve(d.returnValue === "ok" ? (value === null ? true : $("#ask-input").value) : null);
+    d.returnValue = "";
+    d.showModal();
+    if (value !== null) setTimeout(() => $("#ask-input").select(), 50);
+  });
+}
+
+function openSubMenu(sub) {
+  const items = [];
+  if (sub.url) {
+    items.push(["share", shareLabel(), ""]);
+    items.push(["qr", "Показать QR-код", "для другого устройства"]);
+  }
+  if (sub.web_page_url) items.push(["site", "Сайт", ""]);
+  if (sub.support_url) items.push(["support", "Поддержка", ""]);
+  items.push(["rename", "Переименовать", ""]);
+  items.push(["delete", "Удалить подписку", ""]);
+  $("#sub-menu-title").textContent = sub.name;
+  $("#sub-menu-list").innerHTML = items
+    .map(([k, t, h]) => `<button type="button" data-act="${k}" class="${k === "delete" ? "danger" : ""}">${esc(t)}${h ? `<small>${esc(h)}</small>` : ""}</button>`)
+    .join("");
+  const menu = $("#sub-menu");
+  $$("#sub-menu-list button").forEach((b) => (b.onclick = async () => {
+    menu.close();
+    const act = b.dataset.act;
+    if (act === "share") shareLink(sub);
+    if (act === "qr") showQr(sub);
+    if (act === "site") openUrl(sub.web_page_url);
+    if (act === "support") openUrl(sub.support_url);
+    if (act === "rename") {
+      const name = await ask({ title: "Новое название", value: sub.name, ok: "Сохранить" });
+      if (name?.trim()) { await call("rename_subscription", { id: sub.id, name }); await reload(); }
+    }
+    if (act === "delete") {
+      const yes = await ask({ title: `Удалить «${sub.name}»?`, text: "Серверы этой подписки пропадут из списка. Её можно будет добавить снова по ссылке.", ok: "Удалить", danger: true });
+      if (!yes) return;
+      await call("remove_subscription", { id: sub.id }, "Удалено");
+      activeSub = null;
+      await reload();
+    }
+  }));
+  menu.showModal();
 }
 
 $("#add-btn").onclick = async () => {
@@ -347,6 +454,17 @@ $("#paste-btn").onclick = async () => {
     $("#add-btn").click();
   } catch {
     toast("Не удалось прочитать буфер обмена — вставьте ссылку вручную (Ctrl+V)", true);
+  }
+};
+
+$("#scan-btn").onclick = async () => {
+  try {
+    const text = (await invoke("scan_qr")).trim();
+    if (!text) return;
+    $("#add-input").value = text;
+    $("#add-btn").click();
+  } catch (e) {
+    toast(String(e), true);
   }
 };
 
@@ -481,8 +599,56 @@ const CHECKS = [
   ["#s-autoswitch", "auto_switch"],
 ];
 
+const ORDER = {
+  type: ["Такой же тип подключения", "например, VLESS XHTTP → VLESS XHTTP в другой стране"],
+  country: ["Та же страна", "например, Нидерланды → другой сервер в Нидерландах"],
+  subscription: ["Та же подписка", "серверы того же провайдера"],
+};
+let orderDraft = [];  // [[ключ, включён]]
+
+function orderSummary(list) {
+  const on = list.filter(([, v]) => v).map(([k]) => ORDER[k][0].toLowerCase());
+  return [...on, "остальные по скорости"].join(" → ").replace(/^./, (c) => c.toUpperCase());
+}
+
+function renderOrder() {
+  $("#order-list").innerHTML = orderDraft.map(([k, on], i) => `
+    <div class="order-item ${on ? "" : "off"}">
+      <span class="n">${on ? orderDraft.slice(0, i + 1).filter(([, v]) => v).length : ""}</span>
+      <input type="checkbox" data-i="${i}" ${on ? "checked" : ""} aria-label="Использовать шаг" />
+      <span>${esc(ORDER[k][0])}<small>${esc(ORDER[k][1])}</small></span>
+      <button type="button" class="icon" data-up="${i}" ${i === 0 ? "disabled" : ""} aria-label="Выше"><svg><use href="#i-up" /></svg></button>
+      <button type="button" class="icon" data-down="${i}" ${i === orderDraft.length - 1 ? "disabled" : ""} aria-label="Ниже"><svg><use href="#i-down" /></svg></button>
+    </div>`).join("");
+  $$("#order-list input").forEach((c) => (c.onchange = () => { orderDraft[+c.dataset.i][1] = c.checked; renderOrder(); }));
+  const move = (i, d) => { const [x] = orderDraft.splice(i, 1); orderDraft.splice(i + d, 0, x); renderOrder(); };
+  $$("[data-up]").forEach((b) => (b.onclick = () => move(+b.dataset.up, -1)));
+  $$("[data-down]").forEach((b) => (b.onclick = () => move(+b.dataset.down, 1)));
+}
+
+function orderFromSettings() {
+  const on = (data.settings.switch_order ?? []).filter((k) => ORDER[k]);
+  return [...on.map((k) => [k, true]), ...Object.keys(ORDER).filter((k) => !on.includes(k)).map((k) => [k, false])];
+}
+
+$("#order-open").onclick = () => {
+  orderDraft = orderFromSettings();
+  renderOrder();
+  $("#order-dialog").showModal();
+};
+$("#order-dialog").onclose = async () => {
+  if ($("#order-dialog").returnValue !== "ok") return;
+  $("#order-dialog").returnValue = "";
+  const settings = { ...data.settings, switch_order: orderDraft.filter(([, v]) => v).map(([k]) => k) };
+  await call("save_settings", { settings }, "Сохранено");
+  await reload();
+};
+$("#s-autoswitch").onchange = (e) => ($("#order-open").disabled = !e.target.checked);
+
 function renderSettings() {
   const s = data.settings;
+  $("#order-summary").textContent = orderSummary(orderFromSettings());
+  $("#order-open").disabled = !s.auto_switch;
   for (const [sel, key] of FIELDS) if (document.activeElement !== $(sel)) $(sel).value = s[key];
   for (const [sel, key] of CHECKS) $(sel).checked = s[key];
   $("#lan-pass").textContent = s.lan_password;

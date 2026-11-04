@@ -173,6 +173,36 @@ pub fn read_clipboard() -> Result<String, String> {
     Err("только для Android".into())
 }
 
+/// Системное окно «Поделиться» (Android).
+pub fn share_text(text: &str, title: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = imp::call("shareText", serde_json::json!({"text": text, "title": title}))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (text, title);
+        Err("только для Android".into())
+    }
+}
+
+/// Сканирует QR-код камерой (Android). Пустая строка — сканирование отменено.
+pub fn scan_qr() -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        #[derive(Deserialize)]
+        struct R {
+            #[serde(default)]
+            text: String,
+        }
+        let r: R = imp::call("scanQr", ())?;
+        return Ok(r.text);
+    }
+    #[cfg(not(target_os = "android"))]
+    Err("только для Android".into())
+}
+
 /// Открывает настройки уведомлений приложения.
 pub fn open_notification_settings() -> Result<(), String> {
     #[cfg(target_os = "android")]

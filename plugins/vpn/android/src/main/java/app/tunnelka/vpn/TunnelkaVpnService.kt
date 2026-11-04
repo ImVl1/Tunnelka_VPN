@@ -18,6 +18,7 @@ import android.service.quicksettings.TileService
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import hev.htproxy.TProxyService
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.InetSocketAddress
@@ -111,8 +112,10 @@ class TunnelkaVpnService : VpnService() {
     private val main = Handler(Looper.getMainLooper())
     private val procs = mutableListOf<Process>()
     private var tun: ParcelFileDescriptor? = null
+    @Volatile
     private var profile: JSONObject? = null
     private var watchdog: Thread? = null
+    private var monitor: Thread? = null
     private var restarts = 0
 
     @Volatile
@@ -193,6 +196,7 @@ class TunnelkaVpnService : VpnService() {
             startedAt = System.currentTimeMillis() / 1000
             setWanted(this, true)
             startWatchdog()
+            startMonitor()
             updateUi()
         } catch (e: Exception) {
             Log.e(TAG, "start failed", e)
@@ -372,6 +376,8 @@ class TunnelkaVpnService : VpnService() {
     private fun stopInternal() {
         watchdog?.interrupt()
         watchdog = null
+        monitor?.interrupt()
+        monitor = null
         if (hevRunning) {
             try {
                 TProxyService.TProxyStopService()
@@ -468,6 +474,174 @@ class TunnelkaVpnService : VpnService() {
         t.isDaemon = true
         watchdog = t
         t.start()
+    }
+
+    // ------------------------------------------------------------------
+    // Наблюдение за связью
+    // ------------------------------------------------------------------
+
+    /**
+     * Раз в 30 секунд проверяет, что через выбранный сервер есть интернет.
+     * Если сервер перестал отвечать, а у телефона интернет есть: у автовыбора
+     * перепроверяет группу, у сервера с вариантами выбирает рабочий вариант,
+     * иначе (если разрешено) переходит на похожий рабочий сервер — по ступеням,
+     * которые подготовило приложение. Работает и при закрытом приложении.
+     */
+    private fun startMonitor() {
+        val t = Thread {
+            try {
+                while (!Thread.currentThread().isInterrupted) {
+                    Thread.sleep(30_000)
+                    if (state != State.RUNNING) continue
+                    val c = clash() ?: continue
+                    if (delay(c, "proxy", 6000) > 0) continue
+                    Thread.sleep(3_000)
+                    if (state != State.RUNNING) continue
+                    if (delay(c, "proxy", 6000) > 0) continue
+                    // Пропал интернет у самого телефона — менять сервер бесполезно.
+                    if (!ownInternet()) continue
+                    Log.w(TAG, "сервер перестал отвечать")
+                    if (!recover(c)) Thread.sleep(60_000)
+                }
+            } catch (_: InterruptedException) {
+            } catch (e: Exception) {
+                Log.w(TAG, "monitor", e)
+            }
+        }
+        t.isDaemon = true
+        monitor = t
+        t.start()
+    }
+
+    private class Clash(val port: Int, val secret: String)
+
+    private fun clash(): Clash? {
+        val rt = profile?.optJSONObject("runtime") ?: return null
+        val port = rt.optInt("clash_port")
+        return if (port > 0) Clash(port, rt.optString("secret")) else null
+    }
+
+    private fun enc(s: String) = java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
+
+    /** Запрос к Clash API ядра. HTTP вручную: так не мешают правила сети Android. */
+    private fun http(c: Clash, method: String, path: String, body: String?, timeoutMs: Int): Pair<Int, String>? = try {
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", c.port), 1000)
+            s.soTimeout = timeoutMs
+            val b = (body ?: "").toByteArray()
+            val head = "$method $path HTTP/1.0\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${c.secret}\r\n" +
+                "Content-Type: application/json\r\nContent-Length: ${b.size}\r\nConnection: close\r\n\r\n"
+            val out = s.getOutputStream()
+            out.write(head.toByteArray()); out.write(b); out.flush()
+            val text = s.getInputStream().readBytes().toString(Charsets.UTF_8)
+            val code = text.substringAfter(" ", "").take(3).toIntOrNull() ?: 0
+            code to text.substringAfter("\r\n\r\n", "")
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    private val testUrl = "https://www.gstatic.com/generate_204"
+
+    /** Задержка через сервер или группу, мс; 0 — нет ответа. */
+    private fun delay(c: Clash, tag: String, timeoutMs: Int): Int {
+        val r = http(c, "GET", "/proxies/${enc(tag)}/delay?timeout=$timeoutMs&url=${enc(testUrl)}", null, timeoutMs + 2000)
+            ?: return 0
+        if (r.first != 200) return 0
+        return try { JSONObject(r.second).optInt("delay", 0) } catch (_: Exception) { 0 }
+    }
+
+    private fun select(c: Clash, group: String, tag: String): Boolean =
+        http(c, "PUT", "/proxies/${enc(group)}", JSONObject().put("name", tag).toString(), 5000)?.first?.let { it in 200..299 } ?: false
+
+    /** Есть ли интернет у самого телефона. Приложение исключено из VPN, поэтому напрямую. */
+    private fun ownInternet(): Boolean = listOf("77.88.8.8" to 53, "1.1.1.1" to 443, "8.8.8.8" to 443).any { (h, p) ->
+        try {
+            Socket().use { it.connect(InetSocketAddress(h, p), 3000) }; true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Лучший рабочий вариант: (тег сервера, лучший вариант внутри, мс). */
+    private fun testAll(c: Clash, ids: List<String>, groups: JSONObject?): Triple<String, String?, Int>? {
+        val jobs = ids.flatMap { id ->
+            val m = groups?.optJSONArray(id)
+            if (m == null) listOf(id to id) else (0 until m.length()).map { id to m.getString(it) }
+        }
+        if (jobs.isEmpty()) return null
+        val pool = Executors.newFixedThreadPool(minOf(16, jobs.size))
+        return try {
+            val futures = jobs.map { (id, tag) -> pool.submit<Triple<String, String, Int>> { Triple(id, tag, delay(c, tag, 5000)) } }
+            futures.mapNotNull { try { it.get() } catch (_: Exception) { null } }
+                .filter { it.third > 0 }
+                .minByOrNull { it.third }
+                ?.let { Triple(it.first, if (it.first != it.second) it.second else null, it.third) }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun recover(c: Clash): Boolean {
+        val p = profile ?: return false
+        val selected = p.optString("selected")
+        val names = p.optJSONObject("names")
+        val groups = p.optJSONObject("groups")
+        val old = names?.optString(selected)?.takeIf { it.isNotEmpty() } ?: p.optString("server", "сервер")
+        if (selected == "auto" || selected.startsWith("auto-")) {
+            http(c, "GET", "/group/${enc(selected)}/delay?timeout=5000&url=${enc(testUrl)}", null, 9000)
+            if (delay(c, "proxy", 6000) > 0) {
+                report(null, "Автовыбор переключился на рабочий сервер", true)
+                return true
+            }
+            report(null, "Ни один сервер автовыбора сейчас не отвечает", false)
+            return false
+        }
+        if (groups?.has(selected) == true) {
+            val best = testAll(c, listOf(selected), groups)
+            if (best?.second != null && select(c, selected, best.second!!) && delay(c, "proxy", 6000) > 0) return true
+        }
+        if (!p.optBoolean("autoSwitch", true)) {
+            report(null, "«$old» не отвечает — выберите другой сервер", false)
+            return false
+        }
+        val tags = p.optJSONArray("tags")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } ?: emptySet()
+        val tiers = p.optJSONArray("fallback") ?: JSONArray()
+        for (i in 0 until tiers.length()) {
+            if (state != State.RUNNING || Thread.currentThread().isInterrupted) return false
+            val tier = tiers.getJSONArray(i)
+            val ids = (0 until tier.length()).map { tier.getString(it) }.filter { it in tags }
+            val best = testAll(c, ids, groups) ?: continue
+            if (!select(c, "proxy", best.first)) continue
+            best.second?.let { select(c, best.first, it) }
+            val name = names?.optString(best.first)?.takeIf { it.isNotEmpty() } ?: best.first
+            p.put("selected", best.first)
+            p.put("server", name)
+            try {
+                profilePath(this)?.let { File(it).writeText(p.toString()) }
+            } catch (_: Exception) {
+            }
+            postNotification()
+            report(best.first, "«$old» перестал отвечать — подключено через «$name»", true)
+            return true
+        }
+        report(null, "«$old» не отвечает, похожих рабочих серверов сейчас нет", false)
+        return false
+    }
+
+    /** Сообщает приложению о переключении (оно прочитает файл, когда откроется). */
+    private fun report(selected: String?, notice: String, switched: Boolean) {
+        Log.i(TAG, notice)
+        val dir = profile?.optString("workDir")?.takeIf { it.isNotEmpty() } ?: return
+        try {
+            val o = JSONObject()
+                .put("at", System.currentTimeMillis())
+                .put("notice", notice)
+                .put("switched", switched)
+            if (selected != null) o.put("selected", selected)
+            File(dir, "monitor.json").writeText(o.toString())
+        } catch (_: Exception) {
+        }
     }
 
     /** Пользователь отключил VPN в системе или включил другой VPN. */

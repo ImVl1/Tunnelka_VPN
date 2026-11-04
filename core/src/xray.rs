@@ -679,7 +679,7 @@ pub fn build_config(
         "dns": {
             "tag": "xray-dns",
             "hosts": dns_hosts,
-            "servers": [dns],
+            "servers": dns_servers(dns),
             "queryStrategy": if ipv6 { "UseIP" } else { "UseIPv4" }
         },
         "inbounds": inbounds,
@@ -772,6 +772,17 @@ fn sub_bundle(v: &Value, list: &[&Value], main: &str) -> Value {
 
 /// Адрес сервера разрешаем встроенным DNS Xray: запрос уходит из процесса Xray,
 /// и sing-box отпускает его напрямую, без петли через VPN.
+/// DNS для адресов серверов. Обычный DNS-сервер (IP) опрашивается сначала по
+/// TCP, затем по UDP: при «белых списках» операторы часто перехватывают или
+/// режут UDP-запросы к DNS, а TCP проходит (так же настроены конфиги провайдеров).
+fn dns_servers(dns: &str) -> Value {
+    match dns.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => json!([format!("tcp://{ip}:53"), dns]),
+        Ok(std::net::IpAddr::V6(ip)) => json!([format!("tcp://[{ip}]:53"), dns]),
+        Err(_) => json!([dns]),
+    }
+}
+
 fn set_resolver(ob: &mut Value, ipv6: bool) {
     let Some(o) = ob.as_object_mut() else { return };
     let ss = o.entry("streamSettings").or_insert_with(|| json!({}));
@@ -940,7 +951,7 @@ mod tests {
         assert_eq!(x["dns"]["hosts"]["nl.example.com"], "5.6.7.8");
         assert!(x["dns"]["hosts"].get("geosite:category-ads-all").is_none());
         // DNS-серверы подписки не используются для адресов серверов.
-        assert_eq!(x["dns"]["servers"], json!(["77.88.8.8"]));
+        assert_eq!(x["dns"]["servers"], json!(["tcp://77.88.8.8:53", "77.88.8.8"]));
         assert_eq!(x["routing"]["rules"][0]["inboundTag"][0], "xray-dns");
     }
 }
