@@ -337,13 +337,12 @@ impl Engine {
             let _ = std::fs::remove_file(&engine.paths.config);
             let _ = std::fs::remove_file(&engine.paths.xray_config);
         }
-        // Kill switch остался включённым после сбоя приложения. Если подключение
-        // при запуске выключено, возвращаем интернет, иначе ждём подключения.
-        if killswitch::is_active(&engine.paths.data) && !auto_connect {
-            match killswitch::disable(&engine.paths.data) {
-                Ok(()) => engine.log("[app] kill switch от прошлого запуска снят"),
-                Err(e) => engine.log(format!("[app] kill switch: {e}")),
-            }
+        // Kill switch остался включённым после сбоя приложения или компьютера.
+        // Блокировку не снимаем: интернет вернёт только новое подключение или
+        // кнопка «Разблокировать интернет».
+        if killswitch::is_active(&engine.paths.data) {
+            let _ = auto_connect;
+            engine.log("[app] интернет заблокирован kill switch с прошлого запуска — подключитесь или нажмите «Разблокировать интернет»");
         }
         engine
     }
@@ -1463,11 +1462,15 @@ impl Engine {
             done(&self);
             return;
         }
-        if !ok && self.kill_switch_blocks(gen).await {
-            // Мешал kill switch: он отключён, сервер работает.
-            self.check_exit().await;
-        } else if !ok {
+        if !ok {
             self.log("[app] сервер не отвечает");
+            if PLATFORM == Platform::Windows && killswitch::is_active(&self.paths.data) {
+                // На случай, если мешает брандмауэр: его состояние — в журнал.
+                // Блокировку при этом не трогаем.
+                for l in tauri::async_runtime::spawn_blocking(killswitch::diagnose).await.unwrap_or_default() {
+                    self.log(format!("[ks] {l}"));
+                }
+            }
             self.recover(gen).await;
         } else {
             let settings = self.settings();
@@ -1492,83 +1495,6 @@ impl Engine {
         if PLATFORM != Platform::Android {
             self.monitor(gen).await;
         }
-    }
-
-    /// Сервер не отвечает при включённом kill switch (Windows): записывает в
-    /// журнал диагностику брандмауэра, отключает kill switch и проверяет сервер
-    /// ещё раз. true — дело было в kill switch, без него сервер работает.
-    async fn kill_switch_blocks(&self, gen: u64) -> bool {
-        if PLATFORM != Platform::Windows || !killswitch::is_active(&self.paths.data) {
-            return false;
-        }
-        self.log("[app] сервер не отвечает при включённом kill switch — проверяю брандмауэр");
-        // Соединение самого приложения мимо VPN: ему выход разрешён тем же
-        // способом, что и ядру. Если не проходит — правила для программ не действуют.
-        let own = self.own_internet().await;
-        self.log(format!("[ks] прямое соединение приложения: {}", if own { "проходит" } else { "НЕ проходит" }));
-        let lines = tauri::async_runtime::spawn_blocking(killswitch::diagnose).await.unwrap_or_default();
-        // Копия в файле: журнал на экране ограничен по длине.
-        let _ = std::fs::write(
-            self.paths.data.join("killswitch-diag.txt"),
-            format!("прямое соединение приложения: {own}\n{}\n", lines.join("\n")),
-        );
-        for l in lines {
-            self.log(format!("[ks] {l}"));
-        }
-        // Что именно отбрасывает Windows: аудит платформы фильтрации. Пока он
-        // идёт, сервер проверяется ещё раз, чтобы потерянные пакеты попали в запись.
-        let audit = tauri::async_runtime::spawn_blocking(|| killswitch::drops(7));
-        for _ in 0..2 {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            let _ = self.server_delay(TAG_PROXY).await;
-        }
-        for l in audit.await.unwrap_or_default() {
-            let _ = std::fs::OpenOptions::new()
-                .append(true)
-                .open(self.paths.data.join("killswitch-diag.txt"))
-                .map(|mut f| std::io::Write::write_all(&mut f, format!("{l}\n").as_bytes()));
-            self.log(format!("[ks] {l}"));
-        }
-        // Какие условия правила пропускают соединение: по ответам станет ясно,
-        // как именно эта Windows сопоставляет правила с соединениями мимо TUN.
-        for l in tauri::async_runtime::spawn_blocking(ks_matrix).await.unwrap_or_default() {
-            let _ = std::fs::OpenOptions::new()
-                .append(true)
-                .open(self.paths.data.join("killswitch-diag.txt"))
-                .map(|mut f| std::io::Write::write_all(&mut f, format!("{l}\n").as_bytes()));
-            self.log(format!("[ks] {l}"));
-        }
-        let data = self.paths.data.clone();
-        let off = tauri::async_runtime::spawn_blocking(move || killswitch::disable(&data)).await;
-        if !matches!(off, Ok(Ok(()))) {
-            self.log("[app] kill switch отключить не удалось");
-            return false;
-        }
-        self.log("[app] kill switch отключён");
-        let mut ok = false;
-        for _ in 0..3 {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            if !self.same_gen(gen) {
-                return false;
-            }
-            if self.server_delay(TAG_PROXY).await.is_some() {
-                ok = true;
-                break;
-            }
-        }
-        self.log(format!("[ks] без kill switch сервер {}", if ok { "отвечает" } else { "тоже не отвечает" }));
-        let after = tauri::async_runtime::spawn_blocking(|| {
-            crate::netbind::probe("77.88.8.8:443".parse().unwrap(), None, Duration::from_secs(3))
-        })
-        .await
-        .unwrap_or(Err("ошибка".into()));
-        self.log(format!("[ks] тест: без kill switch: {}", match after { Ok(ms) => format!("проходит ({ms} мс)"), Err(e) => format!("нет — {e}") }));
-        if ok {
-            self.rt.lock().unwrap().notice = Some(
-                "Kill switch мешал подключению и был отключён — VPN работает без него. Откройте «Журнал» и пришлите строки с пометкой [ks], чтобы это исправить".into(),
-            );
-        }
-        ok
     }
 
     /// Подключение то же, что при запуске проверки, и работает.
@@ -1934,18 +1860,39 @@ impl Engine {
         }
     }
 
-    /// Отключение по кнопке: ядра останавливаются, kill switch снимается.
+    /// Отключение VPN. Если включён kill switch, блокировка остаётся: интернет
+    /// вернёт новое подключение или «Разблокировать интернет» (`unblock`).
     pub fn disconnect(&self) -> Status {
         let was = self.is_running();
         self.stop_process();
-        if killswitch::is_active(&self.paths.data) {
-            match killswitch::disable(&self.paths.data) {
-                Ok(()) => self.log("[app] kill switch выключен"),
-                Err(e) => self.log(format!("[app] kill switch: {e}")),
-            }
+        let blocked = killswitch::is_active(&self.paths.data);
+        if blocked && !self.settings().kill_switch {
+            // Kill switch в настройках уже выключен — блокировка не нужна.
+            return self.unblock();
         }
         if was {
-            self.log("[app] отключено");
+            self.log(if blocked {
+                "[app] отключено, интернет заблокирован kill switch"
+            } else {
+                "[app] отключено"
+            });
+        }
+        {
+            let mut rt = self.rt.lock().unwrap();
+            rt.last_error = None;
+            rt.notice = None;
+        }
+        self.status()
+    }
+
+    /// «Разблокировать интернет»: VPN останавливается, блокировка kill switch снимается.
+    pub fn unblock(&self) -> Status {
+        self.stop_process();
+        if killswitch::is_active(&self.paths.data) {
+            match killswitch::disable(&self.paths.data) {
+                Ok(()) => self.log("[app] kill switch снят, интернет разблокирован"),
+                Err(e) => self.log(format!("[app] kill switch: {e}")),
+            }
         }
         {
             let mut rt = self.rt.lock().unwrap();
@@ -2060,10 +2007,15 @@ impl Engine {
             || old.switch_order != new.switch_order;
         self.state.lock().unwrap().settings = new;
         self.save();
+        let ks_off = old.kill_switch && !self.settings().kill_switch;
         if connection_changed {
             self.restart_if_running().await?;
         } else if notify_changed {
             self.refresh_profile();
+        }
+        // Kill switch выключили, когда VPN не работает: блокировка больше не нужна.
+        if ks_off && !self.is_running() && killswitch::is_active(&self.paths.data) {
+            return Ok(self.unblock());
         }
         Ok(self.status())
     }
@@ -2501,58 +2453,16 @@ impl Engine {
         Ok(TempCore { _guard: guard, base, secret: run.secret, proxy, groups: built.groups })
     }
 
-    /// Полный выход из приложения: всё останавливается, интернет разблокируется.
+    /// Выход из приложения: ядра останавливаются. Блокировка kill switch
+    /// остаётся (если он включён в настройках): интернет вернёт подключение или
+    /// кнопка «Разблокировать интернет» после следующего запуска.
     #[cfg_attr(mobile, allow(dead_code))]
     pub fn shutdown(&self) {
         self.stop_process();
-        if killswitch::is_active(&self.paths.data) {
+        if killswitch::is_active(&self.paths.data) && !self.settings().kill_switch {
             let _ = killswitch::disable(&self.paths.data);
         }
     }
-}
-
-/// Диагностика kill switch: пробные соединения мимо TUN при разных временных
-/// правилах брандмауэра. Выполняется, пока блокировка ещё включена.
-fn ks_matrix() -> Vec<String> {
-    use crate::netbind::{probe, source_ip};
-    // Не порт 53: соединения с DNS мимо TUN блокирует само ядро (защита от утечки DNS).
-    let target: std::net::SocketAddr = "77.88.8.8:443".parse().unwrap();
-    let t = Duration::from_secs(3);
-    let show = |r: Result<i64, String>| match r {
-        Ok(ms) => format!("проходит ({ms} мс)"),
-        Err(e) => format!("нет — {e}"),
-    };
-    let mut out = vec![];
-    let src = source_ip(target);
-    out.push(format!("тест: адрес отправителя мимо TUN: {}", src.map(|a| a.to_string()).unwrap_or("не определён".into())));
-    out.push(format!("тест: обычная привязка: {}", show(probe(target, None, t))));
-    if let Some(ip) = src {
-        out.push(format!("тест: привязка к адресу {ip}: {}", show(probe(target, Some(ip), t))));
-    }
-    let mut variants = vec![
-        ("по адресу сервера", "-Direction Outbound -RemoteAddress 77.88.8.8".to_string()),
-        ("для System", "-Direction Outbound -Program System".to_string()),
-        ("по протоколу TCP", "-Direction Outbound -Protocol TCP".to_string()),
-    ];
-    if let Some(ip) = src {
-        variants.push(("по локальному адресу", format!("-Direction Outbound -LocalAddress {ip}")));
-        variants.push((
-            "по адаптеру",
-            format!("-Direction Outbound -InterfaceAlias (Get-NetIPAddress -IPAddress '{ip}').InterfaceAlias"),
-        ));
-    }
-    for (name, extra) in variants {
-        let line = match killswitch::test_rule(&extra) {
-            Ok(()) => {
-                std::thread::sleep(Duration::from_millis(400));
-                show(probe(target, None, t))
-            }
-            Err(e) => format!("правило не создано — {e}"),
-        };
-        out.push(format!("тест: правило {name}: {line}"));
-    }
-    let _ = killswitch::test_rule("");
-    out
 }
 
 /// Репозиторий с выпусками приложения.

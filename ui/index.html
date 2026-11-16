@@ -187,7 +187,7 @@
         <label class="switch"><input type="checkbox" id="s-autoswitch" /><span>Если сервер перестал отвечать — переключаться на похожий <small>Пока VPN включён, приложение каждые 30 секунд проверяет, что через сервер есть интернет. Если сервер пропал, выбирается похожий рабочий — в порядке, который можно настроить ниже.</small></span></label>
         <button class="setting-link" id="order-open" type="button"><span>Как подбирать замену<small id="order-summary"></small></span><svg><use href="#i-right" /></svg></button>
         <div class="desktop-only">
-          <label class="switch"><input type="checkbox" id="s-killswitch" /><span>Kill switch <small>Пока VPN включён, брандмауэр Windows пропускает в интернет только трафик через VPN. Если ядро упадёт, программы не смогут выйти в сеть напрямую. Кнопка «Отключить» снимает блокировку.</small></span></label>
+          <label class="switch"><input type="checkbox" id="s-killswitch" /><span>Kill switch <small>Брандмауэр Windows пропускает в интернет только трафик через VPN. Если VPN отключится, приложение упадёт или будет закрыто, интернета не будет, пока вы не подключитесь снова или не нажмёте «Разблокировать интернет».</small></span></label>
           <label class="switch"><input type="checkbox" id="s-fallback" /><span>Если в режиме TUN нет интернета — переключаться на системный прокси</span></label>
         </div>
         <div class="android-only">

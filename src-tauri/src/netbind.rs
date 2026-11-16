@@ -24,32 +24,6 @@ pub fn connect_ms(addr: SocketAddr, bypass_tun: bool, timeout: Duration) -> Opti
     Some(start.elapsed().as_millis().max(1) as i64)
 }
 
-/// Адрес, с которого Windows отправляет пакеты через физический адаптер
-/// (для диагностики kill switch).
-pub fn source_ip(target: SocketAddr) -> Option<std::net::IpAddr> {
-    let idx = physical_index()?;
-    let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).ok()?;
-    bind_interface(&sock, idx, true)?;
-    sock.connect(&target.into()).ok()?;
-    sock.local_addr().ok()?.as_socket().map(|a| a.ip())
-}
-
-/// Пробное соединение мимo TUN с текстом ошибки (для диагностики kill switch).
-/// `bind_src` — дополнительно привязать сокет к этому локальному адресу.
-pub fn probe(addr: SocketAddr, bind_src: Option<std::net::IpAddr>, timeout: Duration) -> Result<i64, String> {
-    let idx = physical_index().ok_or("физический адаптер не найден")?;
-    let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-        .map_err(|e| format!("socket: {e}"))?;
-    if let Some(ip) = bind_src {
-        sock.bind(&SocketAddr::new(ip, 0).into()).map_err(|e| format!("bind: {e}"))?;
-    }
-    bind_interface(&sock, idx, true).ok_or("IP_UNICAST_IF не установлен")?;
-    let start = Instant::now();
-    sock.connect_timeout(&addr.into(), timeout)
-        .map_err(|e| format!("{:?}, код {:?}", e.kind(), e.raw_os_error()))?;
-    Ok(start.elapsed().as_millis().max(1) as i64)
-}
-
 #[cfg(windows)]
 fn bind_interface(sock: &socket2::Socket, idx: u32, v4: bool) -> Option<()> {
     use std::os::windows::io::AsRawSocket;

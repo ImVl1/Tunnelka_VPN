@@ -122,6 +122,9 @@ function renderHome() {
   } else if (status?.last_error && !on && !busy) {
     sub.textContent = status.last_error;
     sub.classList.add("error");
+  } else if (!on && !busy && status?.kill_switch_active) {
+    sub.textContent = "Интернет заблокирован kill switch. Подключитесь или нажмите «Разблокировать интернет»";
+    sub.classList.add("error");
   } else if (paused) {
     sub.textContent = "Трафик идёт напрямую. Нажмите на тоннель, чтобы продолжить";
   } else if (on) {
@@ -161,7 +164,7 @@ $("#power").onclick = async () => {
 };
 
 $("#unblock").onclick = async () => {
-  status = await call("disconnect", undefined, "Интернет разблокирован");
+  status = await call("unblock", undefined, "Интернет разблокирован");
   renderHome();
 };
 

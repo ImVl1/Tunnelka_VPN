@@ -81,6 +81,12 @@ async fn disconnect(e: E<'_>) -> Result<Status, String> {
     Ok(e.disconnect())
 }
 
+/// «Разблокировать интернет»: снять блокировку kill switch.
+#[tauri::command]
+async fn unblock(e: E<'_>) -> Result<Status, String> {
+    Ok(e.unblock())
+}
+
 #[tauri::command]
 async fn save_settings(e: E<'_>, settings: Settings) -> Result<Status, String> {
     e.save_settings(settings).await
@@ -228,7 +234,7 @@ async fn install_update(app: tauri::AppHandle, e: E<'_>, url: String) -> Result<
         let path = e.download_update(&url, &dir).await?;
         // Перед установкой — остановить ядра и снять kill switch, иначе
         // установщик не сможет заменить файлы, а интернет останется закрытым.
-        e.shutdown();
+        e.unblock();
         // /P — установка с окном прогресса без вопросов, /R — запустить приложение после.
         // start (ShellExecute) сам спросит права администратора, если нужно.
         std::process::Command::new("cmd")
@@ -417,6 +423,7 @@ pub fn run() {
             select_server,
             connect,
             disconnect,
+            unblock,
             save_settings,
             ping,
             traffic,
