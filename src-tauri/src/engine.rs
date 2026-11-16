@@ -1515,6 +1515,15 @@ impl Engine {
         for l in lines {
             self.log(format!("[ks] {l}"));
         }
+        // Какие условия правила пропускают соединение: по ответам станет ясно,
+        // как именно эта Windows сопоставляет правила с соединениями мимо TUN.
+        for l in tauri::async_runtime::spawn_blocking(ks_matrix).await.unwrap_or_default() {
+            let _ = std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.paths.data.join("killswitch-diag.txt"))
+                .map(|mut f| std::io::Write::write_all(&mut f, format!("{l}\n").as_bytes()));
+            self.log(format!("[ks] {l}"));
+        }
         let data = self.paths.data.clone();
         let off = tauri::async_runtime::spawn_blocking(move || killswitch::disable(&data)).await;
         if !matches!(off, Ok(Ok(()))) {
@@ -1534,6 +1543,12 @@ impl Engine {
             }
         }
         self.log(format!("[ks] без kill switch сервер {}", if ok { "отвечает" } else { "тоже не отвечает" }));
+        let after = tauri::async_runtime::spawn_blocking(|| {
+            crate::netbind::probe("77.88.8.8:53".parse().unwrap(), None, Duration::from_secs(3))
+        })
+        .await
+        .unwrap_or(Err("ошибка".into()));
+        self.log(format!("[ks] тест: без kill switch: {}", match after { Ok(ms) => format!("проходит ({ms} мс)"), Err(e) => format!("нет — {e}") }));
         if ok {
             self.rt.lock().unwrap().notice = Some(
                 "Kill switch мешал подключению и был отключён — VPN работает без него. Откройте «Журнал» и пришлите строки с пометкой [ks], чтобы это исправить".into(),
@@ -2480,6 +2495,48 @@ impl Engine {
             let _ = killswitch::disable(&self.paths.data);
         }
     }
+}
+
+/// Диагностика kill switch: пробные соединения мимо TUN при разных временных
+/// правилах брандмауэра. Выполняется, пока блокировка ещё включена.
+fn ks_matrix() -> Vec<String> {
+    use crate::netbind::{probe, source_ip};
+    let target: std::net::SocketAddr = "77.88.8.8:53".parse().unwrap();
+    let t = Duration::from_secs(3);
+    let show = |r: Result<i64, String>| match r {
+        Ok(ms) => format!("проходит ({ms} мс)"),
+        Err(e) => format!("нет — {e}"),
+    };
+    let mut out = vec![];
+    let src = source_ip(target);
+    out.push(format!("тест: адрес отправителя мимо TUN: {}", src.map(|a| a.to_string()).unwrap_or("не определён".into())));
+    out.push(format!("тест: обычная привязка: {}", show(probe(target, None, t))));
+    if let Some(ip) = src {
+        out.push(format!("тест: привязка к адресу {ip}: {}", show(probe(target, Some(ip), t))));
+    }
+    let mut variants = vec![
+        ("по адресу сервера", "-Direction Outbound -RemoteAddress 77.88.8.8".to_string()),
+        ("по протоколу TCP", "-Direction Outbound -Protocol TCP".to_string()),
+    ];
+    if let Some(ip) = src {
+        variants.push(("по локальному адресу", format!("-Direction Outbound -LocalAddress {ip}")));
+        variants.push((
+            "по адаптеру",
+            format!("-Direction Outbound -InterfaceAlias (Get-NetIPAddress -IPAddress '{ip}').InterfaceAlias"),
+        ));
+    }
+    for (name, extra) in variants {
+        let line = match killswitch::test_rule(&extra) {
+            Ok(()) => {
+                std::thread::sleep(Duration::from_millis(400));
+                show(probe(target, None, t))
+            }
+            Err(e) => format!("правило не создано — {e}"),
+        };
+        out.push(format!("тест: правило {name}: {line}"));
+    }
+    let _ = killswitch::test_rule("");
+    out
 }
 
 /// Репозиторий с выпусками приложения.
