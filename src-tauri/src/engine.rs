@@ -101,6 +101,8 @@ struct Rt {
     domestic: bool,
     /// Результаты идущей проверки пинга (приложение показывает их по мере готовности).
     ping_partial: HashMap<String, i64>,
+    /// Скачивание обновления: (получено, всего) байт.
+    update_progress: (u64, u64),
     /// Android: время последнего переключения сервера VPN-сервисом, мс.
     monitor_at: u64,
 }
@@ -2103,6 +2105,128 @@ impl Engine {
         out
     }
 
+    /// Проверка новой версии приложения на GitHub (только по кнопке).
+    pub async fn check_update(&self) -> Result<UpdateInfo, String> {
+        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let text = self.get_text_any(&url).await?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("ответ GitHub не разобран: {e}"))?;
+        let tag = v["tag_name"].as_str().unwrap_or_default();
+        let latest = tag.trim_start_matches('v').to_string();
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        let want = |name: &str| match PLATFORM {
+            Platform::Android => name.ends_with(".apk"),
+            _ => name.ends_with("-setup.exe") || name.ends_with(".exe"),
+        };
+        let asset = v["assets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| want(a["name"].as_str().unwrap_or_default()));
+        let notes: String = v["body"].as_str().unwrap_or_default().chars().take(1500).collect();
+        Ok(UpdateInfo {
+            available: newer(&latest, &current) && asset.is_some(),
+            current,
+            latest,
+            notes,
+            url: asset.and_then(|a| a["browser_download_url"].as_str()).unwrap_or_default().to_string(),
+            size: asset.and_then(|a| a["size"].as_u64()).unwrap_or(0),
+            page: v["html_url"].as_str().unwrap_or_default().to_string(),
+        })
+    }
+
+    /// Текст по адресу: напрямую, а если не вышло — через работающий VPN.
+    async fn get_text_any(&self, url: &str) -> Result<String, String> {
+        let direct = self
+            .http
+            .get(url)
+            .header("User-Agent", "Tunnelka")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        let resp = match direct {
+            Ok(r) => r,
+            Err(e) => {
+                let Some(proxy) = self.live_proxy() else { return Err(format!("нет связи с GitHub: {e}")) };
+                let c = reqwest::Client::builder()
+                    .proxy(reqwest::Proxy::all(&proxy).map_err(|e| e.to_string())?)
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                c.get(url)
+                    .header("User-Agent", "Tunnelka")
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status())
+                    .map_err(|e| format!("нет связи с GitHub: {e}"))?
+            }
+        };
+        resp.text().await.map_err(|e| e.to_string())
+    }
+
+    /// Скачивает установщик новой версии в `dir`. Возвращает путь к файлу.
+    pub async fn download_update(&self, url: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
+        let allowed = url.starts_with(&format!("https://github.com/{REPO}/releases/download/"));
+        if !allowed {
+            return Err("недопустимый адрес обновления".into());
+        }
+        let name = url.rsplit('/').next().unwrap_or("update").replace(['/', '\\', ':'], "_");
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let path = dir.join(&name);
+        let build = |proxy: Option<String>| -> Result<reqwest::Client, String> {
+            let mut b = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(30));
+            b = match proxy {
+                Some(p) => b.proxy(reqwest::Proxy::all(&p).map_err(|e| e.to_string())?),
+                None => b.no_proxy(),
+            };
+            b.build().map_err(|e| e.to_string())
+        };
+        let mut last = String::new();
+        for proxy in [None, self.live_proxy()] {
+            if last.len() > 0 && proxy.is_none() {
+                break;
+            }
+            let client = build(proxy)?;
+            match self.download_with(&client, url, &path).await {
+                Ok(()) => return Ok(path),
+                Err(e) => last = e,
+            }
+        }
+        Err(format!("не удалось скачать обновление: {last}"))
+    }
+
+    async fn download_with(&self, client: &reqwest::Client, url: &str, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        let mut resp = client
+            .get(url)
+            .header("User-Agent", "Tunnelka")
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?;
+        let total = resp.content_length().unwrap_or(0);
+        self.rt.lock().unwrap().update_progress = (0, total);
+        let tmp = path.with_extension("part");
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut got = 0u64;
+        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            f.write_all(&chunk).map_err(|e| e.to_string())?;
+            got += chunk.len() as u64;
+            self.rt.lock().unwrap().update_progress = (got, total);
+        }
+        drop(f);
+        if total > 0 && got != total {
+            return Err("файл скачался не полностью".into());
+        }
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    }
+
+    pub fn update_progress(&self) -> (u64, u64) {
+        self.rt.lock().unwrap().update_progress
+    }
+
     /// Промежуточные результаты идущей проверки пинга.
     pub fn ping_progress(&self) -> HashMap<String, i64> {
         self.rt.lock().unwrap().ping_partial.clone()
@@ -2305,6 +2429,27 @@ impl Engine {
             let _ = killswitch::disable(&self.paths.data);
         }
     }
+}
+
+/// Репозиторий с выпусками приложения.
+const REPO: &str = "ImVl1/Tunnelka_VPN";
+
+/// Новая версия приложения.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateInfo {
+    pub available: bool,
+    pub current: String,
+    pub latest: String,
+    pub notes: String,
+    pub url: String,
+    pub size: u64,
+    pub page: String,
+}
+
+/// `a` новее `b` (версии вида 1.3.5).
+fn newer(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> { v.split(['.', '-']).map(|x| x.parse().unwrap_or(0)).take(3).collect() };
+    parse(a) > parse(b)
 }
 
 /// Что выбрано: автовыбор по всем подпискам, автовыбор подписки или сервер.

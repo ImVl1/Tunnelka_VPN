@@ -17,6 +17,9 @@
         </intent>
     </queries>
 
+    <!-- Обновление приложения по кнопке «Проверить обновления» -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application>
         <!-- Экран сканера QR (ZXing): поворачивается вместе с телефоном -->
         <activity

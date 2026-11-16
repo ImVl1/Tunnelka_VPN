@@ -62,8 +62,8 @@ async function reload() {
 
 function openUrl(url) {
   if (!/^(https?|tg):\/\//.test(url)) return;
-  if (isAndroid()) window.open(url, "_blank");
-  else call("open_url", { url });
+  // Ссылки всегда открываются во внешнем браузере.
+  call("open_url", { url });
 }
 
 function needsXray() {
@@ -675,6 +675,63 @@ async function showLanAddresses(port) {
     ? list.map((a) => `<div><span>Сервер <code>${esc(a.ip)}</code> · порт <code>${port}</code></span><small>${esc(kind(a.name))}</small></div>`).join("")
     : `<div><span class="muted">Включите точку доступа — здесь появится адрес. Порт: <code>${port}</code></span></div>`;
 }
+
+// ---- обновление приложения: только по кнопке ----
+let updateInfo = null;
+$("#update-check").onclick = async () => {
+  const b = $("#update-check");
+  if (b.classList.contains("busy")) return;
+  b.classList.add("busy");
+  try {
+    updateInfo = await invoke("check_update");
+  } catch (e) {
+    return toast(`Не удалось проверить обновления: ${e}`, true);
+  } finally {
+    b.classList.remove("busy");
+  }
+  if (!updateInfo.available) return toast(`У вас последняя версия — ${updateInfo.current}`);
+  const mb = updateInfo.size ? ` · ${(updateInfo.size / 1048576).toFixed(0)} МБ` : "";
+  $("#update-title").textContent = `Доступна версия ${updateInfo.latest}`;
+  $("#update-sub").textContent = `Сейчас установлена ${updateInfo.current}${mb}. ` + (isAndroid()
+    ? "После скачивания откроется окно установки Android."
+    : "После скачивания приложение закроется, установится новая версия и запустится снова. VPN на это время отключится.");
+  $("#update-notes").textContent = updateInfo.notes.trim();
+  $("#update-progress").hidden = true;
+  $("#update-go").disabled = false;
+  $("#update-later").disabled = false;
+  $("#update-dialog").showModal();
+};
+
+$("#update-go").onclick = async () => {
+  if (!updateInfo) return;
+  const go = $("#update-go");
+  go.disabled = true;
+  $("#update-later").disabled = true;
+  const bar = $("#update-progress");
+  bar.hidden = false;
+  const paint = (got, total) => {
+    const pct = total ? Math.round((got / total) * 100) : 0;
+    bar.querySelector("i").style.width = `${pct}%`;
+    bar.querySelector("span").textContent = total ? `Скачивание… ${pct}%` : "Скачивание…";
+  };
+  paint(0, 0);
+  const timer = setInterval(async () => {
+    try { const [got, total] = await invoke("update_progress"); paint(got, total); } catch { /* */ }
+  }, 300);
+  try {
+    await invoke("install_update", { url: updateInfo.url });
+    bar.querySelector("i").style.width = "100%";
+    bar.querySelector("span").textContent = isAndroid() ? "Подтвердите установку в окне Android" : "Устанавливаю…";
+    if (isAndroid()) setTimeout(() => $("#update-dialog").close(), 1500);
+  } catch (e) {
+    bar.hidden = true;
+    toast(String(e), true);
+    go.disabled = false;
+  } finally {
+    clearInterval(timer);
+    $("#update-later").disabled = false;
+  }
+};
 
 $("#settings-save").onclick = async () => {
   const s = { ...data.settings };

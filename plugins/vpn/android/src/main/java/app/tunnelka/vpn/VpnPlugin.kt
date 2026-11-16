@@ -30,6 +30,16 @@ class StartArgs {
 }
 
 @InvokeArg
+class UrlArgs {
+    var url: String = ""
+}
+
+@InvokeArg
+class PathArgs {
+    var path: String = ""
+}
+
+@InvokeArg
 class ShareArgs {
     var text: String = ""
     var title: String = ""
@@ -204,6 +214,67 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
             val r = JSObject()
             r.put("text", text)
             invoke.resolve(r)
+        }
+    }
+
+    /** Открывает ссылку во внешнем браузере (не внутри приложения). */
+    @Command
+    fun openUrl(invoke: Invoke) {
+        val args = invoke.parseArgs(UrlArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                val i = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(args.url))
+                i.addCategory(Intent.CATEGORY_BROWSABLE)
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                activity.startActivity(i)
+                invoke.resolve(JSObject())
+            } catch (e: Exception) {
+                invoke.reject("не удалось открыть ссылку: ${e.message ?: e}")
+            }
+        }
+    }
+
+    /** Папка для скачанного обновления. */
+    @Command
+    fun updateDir(invoke: Invoke) {
+        val dir = java.io.File(activity.cacheDir, "updates")
+        dir.mkdirs()
+        // Старые скачанные версии больше не нужны.
+        dir.listFiles()?.forEach { it.delete() }
+        val r = JSObject()
+        r.put("path", dir.absolutePath)
+        invoke.resolve(r)
+    }
+
+    /** Системное окно установки скачанного APK. */
+    @Command
+    fun installApk(invoke: Invoke) {
+        val args = invoke.parseArgs(PathArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                if (android.os.Build.VERSION.SDK_INT >= 26 && !activity.packageManager.canRequestPackageInstalls()) {
+                    // Android спросит один раз: разрешить Tunnelka устанавливать приложения.
+                    val s = Intent(
+                        android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        android.net.Uri.parse("package:" + activity.packageName)
+                    )
+                    activity.startActivity(s)
+                    invoke.reject("Разрешите Tunnelka устанавливать приложения, вернитесь и нажмите «Обновить» ещё раз")
+                    return@runOnUiThread
+                }
+                // FileProvider приложения (папка кэша, src-tauri/gen/android).
+                val file = java.io.File(args.path)
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    activity, activity.packageName + ".fileprovider", file
+                )
+                val i = Intent(Intent.ACTION_VIEW)
+                i.setDataAndType(uri, "application/vnd.android.package-archive")
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                activity.startActivity(i)
+                invoke.resolve(JSObject())
+            } catch (e: Exception) {
+                invoke.reject("не удалось начать установку: ${e.message ?: e}")
+            }
         }
     }
 

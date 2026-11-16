@@ -203,6 +203,49 @@ pub fn scan_qr() -> Result<String, String> {
     Err("только для Android".into())
 }
 
+/// Открывает ссылку в браузере (Android).
+pub fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = imp::call("openUrl", serde_json::json!({"url": url}))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = url;
+        Err("только для Android".into())
+    }
+}
+
+/// Папка для скачанного обновления (Android).
+pub fn update_dir() -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    {
+        #[derive(Deserialize)]
+        struct R {
+            path: String,
+        }
+        let r: R = imp::call("updateDir", ())?;
+        return Ok(r.path);
+    }
+    #[cfg(not(target_os = "android"))]
+    Err("только для Android".into())
+}
+
+/// Открывает системное окно установки APK (Android).
+pub fn install_apk(path: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _: serde_json::Value = imp::call("installApk", serde_json::json!({"path": path}))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = path;
+        Err("только для Android".into())
+    }
+}
+
 /// Адрес телефона в локальной сети (точка доступа, USB-модем).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LanAddress {

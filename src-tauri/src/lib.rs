@@ -182,13 +182,13 @@ async fn read_clipboard() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+async fn open_url(url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("tg://")) {
         return Err("недопустимая ссылка".into());
     }
+    // Ссылки открываются в браузере системы, а не внутри приложения.
     #[cfg(windows)]
     {
-        let _ = app;
         use std::os::windows::process::CommandExt;
         std::process::Command::new("rundll32")
             .args(["url.dll,FileProtocolHandler", &url])
@@ -199,9 +199,66 @@ fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        use tauri::Emitter;
-        // На Android ссылку открывает интерфейс через window.open.
-        app.emit("open-url", url).map_err(|e| e.to_string())
+        tauri::async_runtime::spawn_blocking(move || tauri_plugin_tunnelka_vpn::open_url(&url))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+}
+
+/// Проверка новой версии (только по кнопке в настройках).
+#[tauri::command]
+async fn check_update(e: E<'_>) -> Result<engine::UpdateInfo, String> {
+    e.check_update().await
+}
+
+#[tauri::command]
+fn update_progress(e: E<'_>) -> (u64, u64) {
+    e.update_progress()
+}
+
+/// Скачивает и запускает установку новой версии. На ПК приложение закрывается,
+/// установщик обновляет его и запускает снова; на телефоне открывается
+/// системное окно установки.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle, e: E<'_>, url: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let dir = std::env::temp_dir().join("tunnelka-update");
+        let path = e.download_update(&url, &dir).await?;
+        // Перед установкой — остановить ядра и снять kill switch, иначе
+        // установщик не сможет заменить файлы, а интернет останется закрытым.
+        e.shutdown();
+        // /P — установка с окном прогресса без вопросов, /R — запустить приложение после.
+        // start (ShellExecute) сам спросит права администратора, если нужно.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy(), "/P", "/R"])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!("не удалось запустить установщик: {e}"))?;
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            app2.exit(0);
+        });
+        Ok(())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        let dir = tauri::async_runtime::spawn_blocking(tauri_plugin_tunnelka_vpn::update_dir)
+            .await
+            .map_err(|e| e.to_string())??;
+        let path = e.download_update(&url, std::path::Path::new(&dir)).await?;
+        let p = path.to_string_lossy().into_owned();
+        tauri::async_runtime::spawn_blocking(move || tauri_plugin_tunnelka_vpn::install_apk(&p))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
+    {
+        let _ = (app, e, url);
+        Err("обновление поддерживается только на Windows и Android".into())
     }
 }
 
@@ -374,6 +431,9 @@ pub fn run() {
             share_text,
             scan_qr,
             lan_addresses,
+            check_update,
+            update_progress,
+            install_update,
             ping_progress,
             open_url
         ])

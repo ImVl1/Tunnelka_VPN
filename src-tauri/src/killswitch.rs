@@ -151,9 +151,18 @@ pub fn enable(data: &Path, programs: &[PathBuf], tun_cidrs: &[&str]) -> Result<V
             ps_quote(&format!("Tunnelka: {name}"))
         )
     };
-    script += &rule("loopback", "-RemoteAddress 127.0.0.0/8,::1");
+    // Правила-помощники: если брандмауэр какое-то из них не примет, kill switch
+    // всё равно включается (петлевые адреса Windows и так не блокирует; IPv6-адрес
+    // ::1 в правилах брандмауэр вообще не принимает).
+    let optional = |name: &str, extra: &str| {
+        format!(
+            "try {{ New-NetFirewallRule -DisplayName {} -Group $g -Direction Outbound -Action Allow {extra} | Out-Null }} catch {{ }}\n",
+            ps_quote(&format!("Tunnelka: {name}"))
+        )
+    };
+    script += &optional("loopback", "-RemoteAddress 127.0.0.0/8");
     script += &rule("local network", "-RemoteAddress LocalSubnet");
-    script += &rule("DHCP", "-Protocol UDP -RemotePort 67,547");
+    script += &optional("DHCP", "-Protocol UDP -RemotePort 67,547");
     if !tun_cidrs.is_empty() {
         let list = tun_cidrs.iter().map(|c| ps_quote(&network(c))).collect::<Vec<_>>().join(",");
         script += &rule("TUN", &format!("-LocalAddress {list}"));
