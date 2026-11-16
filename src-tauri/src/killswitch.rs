@@ -258,6 +258,47 @@ pub fn diagnose() -> Vec<String> {
     }
 }
 
+/// Диагностика: какие пакеты Windows отбрасывает прямо сейчас и каким
+/// фильтром. На несколько секунд включает аудит платформы фильтрации (WFP),
+/// читает события 5152/5157 из журнала безопасности и находит названия
+/// фильтров. Подкатегории аудита заданы по GUID: их названия зависят от языка.
+#[cfg(windows)]
+pub fn drops(seconds: u32) -> Vec<String> {
+    let script = format!(
+        "$ErrorActionPreference='Continue'\n\
+        $cats='{{0CCE9225-69AE-11D9-BED3-505054503030}}','{{0CCE9226-69AE-11D9-BED3-505054503030}}'\n\
+        $t0=Get-Date\n\
+        foreach ($c in $cats) {{ auditpol /set /subcategory:$c /failure:enable | Out-Null }}\n\
+        Start-Sleep -Seconds {seconds}\n\
+        foreach ($c in $cats) {{ auditpol /set /subcategory:$c /failure:disable | Out-Null }}\n\
+        $ev=@(Get-WinEvent -FilterHashtable @{{LogName='Security'; Id=5152,5157; StartTime=$t0}} -MaxEvents 4000 -ErrorAction SilentlyContinue)\n\
+        \"drops total: $($ev.Count)\"\n\
+        $rows=$ev | ForEach-Object {{ $p=$_.Properties; [pscustomobject]@{{ k=\"$($_.Id) app=$($p[1].Value) dir=$($p[2].Value) $($p[3].Value)->$($p[5].Value):$($p[6].Value) proto=$($p[7].Value) filter=$($p[8].Value) layer=$($p[10].Value)\"; f=\"$($p[8].Value)\" }} }}\n\
+        $grp=@($rows | Group-Object k | Sort-Object Count -Descending)\n\
+        $ours=@($grp | Where-Object {{ $_.Name -match 'tunnelka|sing-box|xray' }} | Select-Object -First 20)\n\
+        $rest=@($grp | Where-Object {{ $_.Name -notmatch 'tunnelka|sing-box|xray' }} | Select-Object -First 25)\n\
+        foreach ($x1 in $ours) {{ \"drop x$($x1.Count) $($x1.Name)\" }}\n\
+        foreach ($x1 in $rest) {{ \"other x$($x1.Count) $($x1.Name)\" }}\n\
+        $ids=@(@($ours + $rest) | ForEach-Object {{ $_.Group[0].f }} | Select-Object -Unique | Select-Object -First 15)\n\
+        if ($ids.Count -gt 0) {{\n\
+          $file=Join-Path $env:TEMP 'tunnelka-wfp.xml'\n\
+          netsh wfp show filters file=$file | Out-Null\n\
+          [xml]$x=Get-Content -Path $file -Encoding UTF8\n\
+          foreach ($i in $ids) {{ $f=$x.wfpdiag.filters.item | Where-Object {{ $_.filterId -eq $i }} | Select-Object -First 1; if ($f) {{ \"filter ${{i}}: name=$($f.displayData.name) action=$($f.action.type) layer=$($f.layerKey) sublayer=$($f.subLayerKey) provider=$($f.providerKey)\" }} else {{ \"filter ${{i}}: не найден\" }} }}\n\
+          Remove-Item $file -ErrorAction SilentlyContinue\n\
+        }}\n"
+    );
+    match run_ps(&script) {
+        Ok(out) => out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        Err(e) => vec![format!("аудит не удался: {e}")],
+    }
+}
+
+#[cfg(not(windows))]
+pub fn drops(_seconds: u32) -> Vec<String> {
+    Vec::new()
+}
+
 /// Временное правило для диагностики: `extra` — условия New-NetFirewallRule.
 /// Пустая строка — только удалить прежнее временное правило.
 #[cfg(windows)]

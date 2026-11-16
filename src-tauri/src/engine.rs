@@ -1515,6 +1515,20 @@ impl Engine {
         for l in lines {
             self.log(format!("[ks] {l}"));
         }
+        // Что именно отбрасывает Windows: аудит платформы фильтрации. Пока он
+        // идёт, сервер проверяется ещё раз, чтобы потерянные пакеты попали в запись.
+        let audit = tauri::async_runtime::spawn_blocking(|| killswitch::drops(7));
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = self.server_delay(TAG_PROXY).await;
+        }
+        for l in audit.await.unwrap_or_default() {
+            let _ = std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.paths.data.join("killswitch-diag.txt"))
+                .map(|mut f| std::io::Write::write_all(&mut f, format!("{l}\n").as_bytes()));
+            self.log(format!("[ks] {l}"));
+        }
         // Какие условия правила пропускают соединение: по ответам станет ясно,
         // как именно эта Windows сопоставляет правила с соединениями мимо TUN.
         for l in tauri::async_runtime::spawn_blocking(ks_matrix).await.unwrap_or_default() {
@@ -1544,7 +1558,7 @@ impl Engine {
         }
         self.log(format!("[ks] без kill switch сервер {}", if ok { "отвечает" } else { "тоже не отвечает" }));
         let after = tauri::async_runtime::spawn_blocking(|| {
-            crate::netbind::probe("77.88.8.8:53".parse().unwrap(), None, Duration::from_secs(3))
+            crate::netbind::probe("77.88.8.8:443".parse().unwrap(), None, Duration::from_secs(3))
         })
         .await
         .unwrap_or(Err("ошибка".into()));
@@ -2501,7 +2515,8 @@ impl Engine {
 /// правилах брандмауэра. Выполняется, пока блокировка ещё включена.
 fn ks_matrix() -> Vec<String> {
     use crate::netbind::{probe, source_ip};
-    let target: std::net::SocketAddr = "77.88.8.8:53".parse().unwrap();
+    // Не порт 53: соединения с DNS мимо TUN блокирует само ядро (защита от утечки DNS).
+    let target: std::net::SocketAddr = "77.88.8.8:443".parse().unwrap();
     let t = Duration::from_secs(3);
     let show = |r: Result<i64, String>| match r {
         Ok(ms) => format!("проходит ({ms} мс)"),
@@ -2516,6 +2531,7 @@ fn ks_matrix() -> Vec<String> {
     }
     let mut variants = vec![
         ("по адресу сервера", "-Direction Outbound -RemoteAddress 77.88.8.8".to_string()),
+        ("входящее по адресу сервера", "-Direction Inbound -RemoteAddress 77.88.8.8".to_string()),
         ("по протоколу TCP", "-Direction Outbound -Protocol TCP".to_string()),
     ];
     if let Some(ip) = src {
