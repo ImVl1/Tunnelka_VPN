@@ -251,8 +251,15 @@
     <section id="view-logs" class="view">
       <header class="view-head">
         <div><h2>Журнал</h2><p class="lead">Сообщения приложения и ядер</p></div>
-        <button class="btn" id="logs-clear">Очистить</button>
+        <div class="head-actions">
+          <button class="btn" id="logs-copy">Скопировать</button>
+          <button class="btn" id="logs-clear">Очистить</button>
+        </div>
       </header>
+      <div class="pills log-filter" id="log-filter">
+        <button data-f="all" class="active">Всё</button>
+        <button data-f="app">Только приложение</button>
+      </div>
       <pre id="log-box" class="card"></pre>
     </section>
   </main>

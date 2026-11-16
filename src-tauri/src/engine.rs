@@ -1507,6 +1507,11 @@ impl Engine {
         let own = self.own_internet().await;
         self.log(format!("[ks] прямое соединение приложения: {}", if own { "проходит" } else { "НЕ проходит" }));
         let lines = tauri::async_runtime::spawn_blocking(killswitch::diagnose).await.unwrap_or_default();
+        // Копия в файле: журнал на экране ограничен по длине.
+        let _ = std::fs::write(
+            self.paths.data.join("killswitch-diag.txt"),
+            format!("прямое соединение приложения: {own}\n{}\n", lines.join("\n")),
+        );
         for l in lines {
             self.log(format!("[ks] {l}"));
         }
@@ -2644,8 +2649,18 @@ async fn tcp_ping(host: &str, port: u16) -> Option<i64> {
 fn push_log(logs: &Mutex<VecDeque<String>>, line: String) {
     let mut l = logs.lock().unwrap();
     l.push_back(line);
+    // Ядра пишут сотни строк в минуту. Чтобы они не вытесняли редкие и важные
+    // сообщения приложения (ошибки, диагностику), первыми удаляются строки ядер.
     while l.len() > MAX_LOG_LINES {
-        l.pop_front();
+        let own = |x: &String| x.starts_with("[app]") || x.starts_with("[ks]") || x.starts_with("[vpn]");
+        match l.iter().position(|x| !own(x)) {
+            Some(i) => {
+                l.remove(i);
+            }
+            None => {
+                l.pop_front();
+            }
+        }
     }
 }
 

@@ -759,13 +759,35 @@ async function renderBattery() {
 // журнал
 // ---------------------------------------------------------------------------
 
+// «Только приложение» — сообщения самой Tunnelka без сотен строк ядер.
+let logFilter = "all";
+const ownLine = (x) => /^\[(app|ks|vpn)\]/.test(x);
+async function logLines() {
+  const l = await invoke("logs");
+  return logFilter === "app" ? l.filter(ownLine) : l;
+}
 async function loadLogs() {
   const box = $("#log-box");
   const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-  const l = await invoke("logs");
-  box.textContent = l.join("\n") || "Журнал пуст. Здесь появятся сообщения ядра после подключения.";
+  const l = await logLines();
+  box.textContent = l.join("\n") || (logFilter === "app" ? "Сообщений приложения пока нет." : "Журнал пуст. Здесь появятся сообщения ядра после подключения.");
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
+$$("#log-filter button").forEach((b) => (b.onclick = () => {
+  logFilter = b.dataset.f;
+  $$("#log-filter button").forEach((x) => x.classList.toggle("active", x === b));
+  loadLogs();
+}));
+$("#logs-copy").onclick = async () => {
+  const text = (await logLines()).join("\n");
+  if (!text) return toast("Журнал пуст");
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const t = document.createElement("textarea");
+    t.value = text; document.body.append(t); t.select(); document.execCommand("copy"); t.remove();
+  }
+  toast("Журнал скопирован");
+};
 $$("[data-link]").forEach((b) => (b.onclick = () => openUrl(b.dataset.link)));
 $("#logs-clear").onclick = async () => { await invoke("clear_logs"); loadLogs(); };
 
