@@ -185,14 +185,13 @@ pub fn enable(data: &Path, programs: &[PathBuf], tun_cidrs: &[&str]) -> Result<V
     for p in programs.iter().filter(|p| p.exists()) {
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         script += &rule(&name, &format!("-Program {}", ps_quote(&plain_path(&p.to_string_lossy()))));
-        // Ответы на соединения этих программ: входящее разрешение (не обязательно,
-        // но на части систем без него ответы теряются).
-        script += &format!(
-            "try {{ New-NetFirewallRule -DisplayName {} -Group $g -Direction Inbound -Action Allow -Program {} | Out-Null }} catch {{ }}\n",
-            ps_quote(&format!("Tunnelka: {name} (in)")),
-            ps_quote(&plain_path(&p.to_string_lossy()))
-        );
     }
+    // Ядро отправляет свои соединения мимо TUN через физический адаптер
+    // (IP_UNICAST_IF). Такие соединения Windows при повторной проверке
+    // записывает на «System», а не на sing-box.exe, и правило по программе к ним
+    // не применяется — без этого разрешения ядро не может выйти к серверу.
+    // Соединения остальных программ остаются за ними и блокируются как раньше.
+    script += &rule("System", "-Program System");
     script += "$step='блокировка исходящих соединений'\n";
     script += "Set-NetFirewallProfile -All -DefaultOutboundAction Block\n";
     // Профили, где брандмауэр выключен: там блокировка не сработает.

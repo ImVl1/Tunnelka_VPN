@@ -2531,7 +2531,7 @@ fn ks_matrix() -> Vec<String> {
     }
     let mut variants = vec![
         ("по адресу сервера", "-Direction Outbound -RemoteAddress 77.88.8.8".to_string()),
-        ("входящее по адресу сервера", "-Direction Inbound -RemoteAddress 77.88.8.8".to_string()),
+        ("для System", "-Direction Outbound -Program System".to_string()),
         ("по протоколу TCP", "-Direction Outbound -Protocol TCP".to_string()),
     ];
     if let Some(ip) = src {
