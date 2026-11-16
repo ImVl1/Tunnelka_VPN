@@ -226,6 +226,36 @@ pub fn disable(data: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Диагностика: что сейчас в брандмауэре. Строки пишутся в журнал приложения,
+/// чтобы по ним можно было понять, почему kill switch мешает подключению.
+#[cfg(windows)]
+pub fn diagnose() -> Vec<String> {
+    let mut script = String::new();
+    script += &format!("$g={}\n", ps_quote(GROUP));
+    script += "$ErrorActionPreference='Continue'\n\
+        Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object { \"profile $($_.Name): enabled=$($_.Enabled) out=$($_.DefaultOutboundAction) in=$($_.DefaultInboundAction) localRules=$($_.AllowLocalFirewallRules)\" }\n\
+        Get-NetConnectionProfile | ForEach-Object { \"network $($_.InterfaceAlias): $($_.NetworkCategory)\" }\n\
+        $rules = @(Get-NetFirewallRule -Group $g -ErrorAction SilentlyContinue)\n\
+        \"rules in store: $($rules.Count)\"\n\
+        foreach ($r in $rules) { $a = $r | Get-NetFirewallApplicationFilter; $d = $r | Get-NetFirewallAddressFilter; \"rule $($r.DisplayName): enabled=$($r.Enabled) action=$($r.Action) profile=$($r.Profile) status=$($r.PrimaryStatus) program=$($a.Program) local=$($d.LocalAddress -join ',') remote=$($d.RemoteAddress -join ',')\" }\n\
+        $act = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object { $_.Group -eq $g })\n\
+        \"rules active: $($act.Count)\"\n\
+        $blk = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Block -Enabled True -ErrorAction SilentlyContinue)\n\
+        \"outbound block rules: $($blk.Count)\"\n\
+        $blk | Select-Object -First 12 | ForEach-Object { \"block $($_.DisplayName) [$($_.PolicyStoreSourceType)]\" }\n\
+        Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction SilentlyContinue | ForEach-Object { \"third-party firewall: $($_.displayName)\" }\n\
+        Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue | ForEach-Object { \"antivirus: $($_.displayName)\" }\n";
+    match run_ps(&script) {
+        Ok(out) => out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        Err(e) => vec![format!("диагностика не удалась: {e}")],
+    }
+}
+
+#[cfg(not(windows))]
+pub fn diagnose() -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(not(windows))]
 pub fn enable(_data: &Path, _programs: &[PathBuf], _tun: &[&str]) -> Result<Vec<String>, String> {
     Err("kill switch доступен только в Windows".into())

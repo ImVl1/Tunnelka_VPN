@@ -1463,7 +1463,10 @@ impl Engine {
             done(&self);
             return;
         }
-        if !ok {
+        if !ok && self.kill_switch_blocks(gen).await {
+            // Мешал kill switch: он отключён, сервер работает.
+            self.check_exit().await;
+        } else if !ok {
             self.log("[app] сервер не отвечает");
             self.recover(gen).await;
         } else {
@@ -1489,6 +1492,49 @@ impl Engine {
         if PLATFORM != Platform::Android {
             self.monitor(gen).await;
         }
+    }
+
+    /// Сервер не отвечает при включённом kill switch (Windows): записывает в
+    /// журнал диагностику брандмауэра, отключает kill switch и проверяет сервер
+    /// ещё раз. true — дело было в kill switch, без него сервер работает.
+    async fn kill_switch_blocks(&self, gen: u64) -> bool {
+        if PLATFORM != Platform::Windows || !killswitch::is_active(&self.paths.data) {
+            return false;
+        }
+        self.log("[app] сервер не отвечает при включённом kill switch — проверяю брандмауэр");
+        // Соединение самого приложения мимо VPN: ему выход разрешён тем же
+        // способом, что и ядру. Если не проходит — правила для программ не действуют.
+        let own = self.own_internet().await;
+        self.log(format!("[ks] прямое соединение приложения: {}", if own { "проходит" } else { "НЕ проходит" }));
+        let lines = tauri::async_runtime::spawn_blocking(killswitch::diagnose).await.unwrap_or_default();
+        for l in lines {
+            self.log(format!("[ks] {l}"));
+        }
+        let data = self.paths.data.clone();
+        let off = tauri::async_runtime::spawn_blocking(move || killswitch::disable(&data)).await;
+        if !matches!(off, Ok(Ok(()))) {
+            self.log("[app] kill switch отключить не удалось");
+            return false;
+        }
+        self.log("[app] kill switch отключён");
+        let mut ok = false;
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if !self.same_gen(gen) {
+                return false;
+            }
+            if self.server_delay(TAG_PROXY).await.is_some() {
+                ok = true;
+                break;
+            }
+        }
+        self.log(format!("[ks] без kill switch сервер {}", if ok { "отвечает" } else { "тоже не отвечает" }));
+        if ok {
+            self.rt.lock().unwrap().notice = Some(
+                "Kill switch мешал подключению и был отключён — VPN работает без него. Откройте «Журнал» и пришлите строки с пометкой [ks], чтобы это исправить".into(),
+            );
+        }
+        ok
     }
 
     /// Подключение то же, что при запуске проверки, и работает.
