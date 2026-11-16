@@ -76,6 +76,21 @@ fn decode(bytes: &[u8]) -> String {
     }
 }
 
+/// Путь в обычном виде. Tauri отдаёт пути с префиксом `\\?\` (например,
+/// `\\?\C:\Program Files\Tunnelka\sing-box.exe`), а брандмауэр Windows такой
+/// путь не принимает: «Приложение содержит недопустимые знаки».
+#[cfg_attr(not(windows), allow(dead_code))]
+fn plain_path(p: &str) -> String {
+    let p = p.replace('/', "\\");
+    if let Some(rest) = p.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else if let Some(rest) = p.strip_prefix("\\\\?\\") {
+        rest.to_string()
+    } else {
+        p
+    }
+}
+
 /// Сеть CIDR без «лишних» битов адреса: 172.19.0.1/30 → 172.19.0.0/30.
 /// Брандмауэр Windows принимает не все записи с битами узла.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -169,7 +184,7 @@ pub fn enable(data: &Path, programs: &[PathBuf], tun_cidrs: &[&str]) -> Result<V
     }
     for p in programs.iter().filter(|p| p.exists()) {
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        script += &rule(&name, &format!("-Program {}", ps_quote(&p.to_string_lossy())));
+        script += &rule(&name, &format!("-Program {}", ps_quote(&plain_path(&p.to_string_lossy()))));
     }
     script += "$step='блокировка исходящих соединений'\n";
     script += "Set-NetFirewallProfile -All -DefaultOutboundAction Block\n";
@@ -232,6 +247,9 @@ mod tests {
         assert_eq!(super::decode(&[0x8E, 0xE2, 0xAA, 0xA0, 0xA7, 0xA0, 0xAD, 0xAE]), "Отказано");
         assert_eq!(super::decode("ок".as_bytes()), "ок");
         assert!(super::wrap_script("x").contains("UTF8"));
+        assert_eq!(super::plain_path(r"\\?\C:\Program Files\Tunnelka\sing-box.exe"), r"C:\Program Files\Tunnelka\sing-box.exe");
+        assert_eq!(super::plain_path(r"\\?\UNC\srv\share\a.exe"), r"\\srv\share\a.exe");
+        assert_eq!(super::plain_path(r"C:\a\b.exe"), r"C:\a\b.exe");
         // «ab» в UTF-16LE = 61 00 62 00
         assert_eq!(super::encode_command("ab"), "YQBiAA==");
     }
