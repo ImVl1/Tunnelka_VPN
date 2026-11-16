@@ -1149,7 +1149,15 @@ impl Engine {
                         self.log("[app] kill switch включён");
                         Ok(())
                     }
-                    Err(e) => Err(format!("kill switch: {e}")),
+                    Err(e) => {
+                        // Без kill switch VPN всё равно работает — не оставляем
+                        // пользователя совсем без интернета, а сообщаем, что не так.
+                        self.log(format!("[app] kill switch не включился: {e}"));
+                        self.rt.lock().unwrap().notice = Some(format!(
+                            "Kill switch не включился, VPN работает без него. Причина — {e}"
+                        ));
+                        Ok(())
+                    }
                 },
                 None => Ok(()),
             },
@@ -1936,6 +1944,10 @@ impl Engine {
         let old = self.settings();
         if new.mixed_port != 0 && new.mixed_port < 1024 {
             return Err(format!("порт {} недопустим, используйте 1024–65535 или 0", new.mixed_port));
+        }
+        // Раздача — только с телефона через точку доступа.
+        if PLATFORM != Platform::Android {
+            new.allow_lan = false;
         }
         if new.allow_lan && new.lan_port < 1024 {
             return Err(format!("порт {} недопустим, используйте 1024–65535", new.lan_port));

@@ -222,33 +222,61 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    /** Сканирует QR-код камерой (сканер Google Play services). */
+    /**
+     * Адреса телефона в локальных сетях (точка доступа, USB-модем) — их
+     * подключённые устройства указывают как адрес прокси.
+     */
+    @Command
+    fun lanAddresses(invoke: Invoke) {
+        val list = JSArray()
+        try {
+            for (ni in java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
+                // Мобильный интернет (rmnet, ccmni) и служебные интерфейсы — не локальная сеть.
+                val n = ni.name
+                if (!ni.isUp || ni.isLoopback || listOf("tun", "rmnet", "ccmni", "dummy", "clat", "v4-", "ipsec", "p2p").any { n.startsWith(it) }) continue
+                for (a in java.util.Collections.list(ni.inetAddresses)) {
+                    if (a is java.net.Inet4Address && a.isSiteLocalAddress) {
+                        val o = JSObject()
+                        o.put("name", ni.name)
+                        o.put("ip", a.hostAddress)
+                        list.put(o)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        val r = JSObject()
+        r.put("list", list)
+        invoke.resolve(r)
+    }
+
+    /** Сканирует QR-код камерой (ZXing). Пустой текст — пользователь передумал. */
     @Command
     fun scanQr(invoke: Invoke) {
-        activity.runOnUiThread {
-            try {
-                val options = com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions.Builder()
-                    .setBarcodeFormats(com.google.mlkit.vision.barcode.common.Barcode.FORMAT_QR_CODE)
-                    .build()
-                com.google.mlkit.vision.codescanner.GmsBarcodeScanning.getClient(activity, options)
-                    .startScan()
-                    .addOnSuccessListener { code ->
-                        val r = JSObject()
-                        r.put("text", code.rawValue ?: "")
-                        invoke.resolve(r)
-                    }
-                    .addOnCanceledListener {
-                        val r = JSObject()
-                        r.put("text", "")
-                        invoke.resolve(r)
-                    }
-                    .addOnFailureListener { e ->
-                        invoke.reject("сканер QR-кодов недоступен: ${e.message ?: e}. Нужны сервисы Google Play")
-                    }
-            } catch (e: Throwable) {
-                invoke.reject("сканер QR-кодов недоступен: ${e.message ?: e}")
-            }
+        try {
+            val intent = com.journeyapps.barcodescanner.ScanOptions()
+                .setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
+                .setPrompt("Наведите камеру на QR-код подписки или сервера")
+                .setBeepEnabled(false)
+                .setOrientationLocked(false)
+                .createScanIntent(activity)
+            startActivityForResult(invoke, intent, "scanResult")
+        } catch (e: Throwable) {
+            invoke.reject("не удалось открыть камеру: ${e.message ?: e}")
         }
+    }
+
+    @ActivityCallback
+    fun scanResult(invoke: Invoke, result: androidx.activity.result.ActivityResult) {
+        val parsed = com.journeyapps.barcodescanner.ScanIntentResult.parseActivityResult(result.resultCode, result.data)
+        val text = parsed?.contents ?: ""
+        if (text.isEmpty() && parsed?.originalIntent?.hasExtra(com.google.zxing.client.android.Intents.Scan.MISSING_CAMERA_PERMISSION) == true) {
+            invoke.reject("нет разрешения на камеру — разрешите его в настройках приложения")
+            return
+        }
+        val r = JSObject()
+        r.put("text", text)
+        invoke.resolve(r)
     }
 
     @Command

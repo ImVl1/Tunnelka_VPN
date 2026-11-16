@@ -46,7 +46,7 @@
 - DNS queries and IPv6 never bypass the tunnel.
 - Local ports are randomized on every connection and protected by a random password, so other programs can't discover or use the proxy.
 
-**Convenience.** Tray icon, start with Windows and connect on launch (both off by default), sharing the VPN with the local network behind a password, and a log viewer.
+**Convenience.** Tray icon, start with Windows and connect on launch (both off by default), and a log viewer. On Android, the VPN can be shared with devices connected to the phone's hotspot or USB tethering (they set the phone as a proxy in their Wi-Fi settings; the same site rules apply).
 
 ## System requirements
 

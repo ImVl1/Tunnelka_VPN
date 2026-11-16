@@ -651,11 +651,30 @@ function renderSettings() {
   $("#order-open").disabled = !s.auto_switch;
   for (const [sel, key] of FIELDS) if (document.activeElement !== $(sel)) $(sel).value = s[key];
   for (const [sel, key] of CHECKS) $(sel).checked = s[key];
-  $("#lan-pass").textContent = s.lan_password;
   $("#lan-info").hidden = !s.allow_lan;
+  if (s.allow_lan) showLanAddresses(s.lan_port);
   if (isAndroid() && !renderSettings.battery) { renderSettings.battery = true; renderBattery(); }
 }
-$("#s-lan").onchange = (e) => ($("#lan-info").hidden = !e.target.checked);
+$("#s-lan").onchange = (e) => {
+  $("#lan-info").hidden = !e.target.checked;
+  if (e.target.checked) showLanAddresses(+$("#s-lan-port").value || data.settings.lan_port);
+};
+$("#s-lan-port").oninput = (e) => showLanAddresses(+e.target.value || data.settings.lan_port);
+
+// Точку доступа могут включить, пока открыты настройки, — адрес обновляется сам.
+setInterval(() => {
+  if (isAndroid() && view === "settings" && $("#s-lan").checked) showLanAddresses(+$("#s-lan-port").value || data.settings.lan_port);
+}, 5000);
+
+// Адреса телефона в сети точки доступа: их указывают на подключённом устройстве.
+async function showLanAddresses(port) {
+  let list = [];
+  try { list = await invoke("lan_addresses"); } catch { /* */ }
+  const kind = (n) => /^(swlan|ap|softap|wlan[1-9])/.test(n) ? "точка доступа" : /^(rndis|ncm|usb)/.test(n) ? "USB-модем" : /^bt/.test(n) ? "Bluetooth" : /^wlan0$/.test(n) ? "Wi-Fi" : n;
+  $("#lan-addr").innerHTML = list.length
+    ? list.map((a) => `<div><span>Сервер <code>${esc(a.ip)}</code> · порт <code>${port}</code></span><small>${esc(kind(a.name))}</small></div>`).join("")
+    : `<div><span class="muted">Включите точку доступа — здесь появится адрес. Порт: <code>${port}</code></span></div>`;
+}
 
 $("#settings-save").onclick = async () => {
   const s = { ...data.settings };

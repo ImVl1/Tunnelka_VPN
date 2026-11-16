@@ -144,10 +144,10 @@
         </div>
         <div class="card block">
           <h3>Сайты напрямую</h3>
-          <textarea id="direct-domains" rows="7" placeholder="gosuslugi.ru&#10;keyword:bank&#10;192.168.50.0/24"></textarea>
+          <textarea id="direct-domains" rows="7" placeholder="gosuslugi.ru&#10;https://www.sberbank.ru&#10;*.рф&#10;192.168.50.0/24"></textarea>
         </div>
       </div>
-      <p class="hint">По одному на строку. Домен включает поддомены. Можно указывать IP и подсети, <code>full:</code>, <code>keyword:</code>, <code>regexp:</code>. Правила для сайтов важнее правил для приложений.</p>
+      <p class="hint">По одному на строку или через запятую. Можно вставить адрес из браузера (<code>https://www.site.ru/page</code>) — правило будет для всего сайта вместе с поддоменами. <code>*.ru</code> — все сайты в зоне .ru. Также можно указывать IP и подсети, <code>full:</code>, <code>keyword:</code>, <code>regexp:</code>. Правила для сайтов важнее правил для приложений.</p>
 
       <div class="card block">
         <label class="switch"><input type="checkbox" id="ru-direct" /><span>Российские сайты и IP-адреса напрямую <small>.ru, .рф, .su и базы geosite/geoip. Локальная сеть всегда идёт напрямую.</small></span></label>
@@ -194,6 +194,7 @@
       </div>
 
       <div class="card block form">
+        <h3>Подключение и DNS</h3>
         <label>Ядро для VLESS / VMess / Trojan
           <select id="s-core">
             <option value="auto">Авто: sing-box, Xray для XHTTP</option>
@@ -209,13 +210,21 @@
         </label>
       </div>
 
-      <div class="card block">
-        <h3>Раздача в локальную сеть</h3>
-        <label class="switch"><input type="checkbox" id="s-lan" /><span>Разрешить другим устройствам подключаться через этот VPN</span></label>
-        <div class="pair" id="lan-info">
-          <div><span class="label">Порт (HTTP и SOCKS5)</span><input id="s-lan-port" type="number" min="1024" max="65535" /></div>
-          <div><span class="label">Логин</span><code>tunnelka</code></div>
-          <div><span class="label">Пароль</span><code id="lan-pass"></code></div>
+      <div class="card block android-only">
+        <h3>Раздача VPN через точку доступа</h3>
+        <label class="switch"><input type="checkbox" id="s-lan" /><span>VPN для устройств, подключённых к телефону <small>Ноутбук или другой телефон, подключённый к вашей точке доступа или USB-модему, тоже сможет ходить через VPN — по тем же правилам: российские сайты напрямую (если включено), списки сайтов «через VPN» и «напрямую». Разделение по приложениям на них не действует.</small></span></label>
+        <div id="lan-info">
+          <label>Порт<input id="s-lan-port" type="number" min="1024" max="65535" /></label>
+          <div class="lan-how">
+            <b>Как подключить устройство</b>
+            <ol>
+              <li>Включите точку доступа на телефоне и VPN в Tunnelka.</li>
+              <li>На устройстве откройте настройки Wi-Fi → сеть телефона → <b>Прокси: вручную</b>.</li>
+              <li>Укажите сервер и порт:</li>
+            </ol>
+            <div class="lan-addr" id="lan-addr"></div>
+            <p class="hint">Без этой настройки устройство пользуется интернетом телефона напрямую, мимо VPN. Через прокси идут браузеры и большинство приложений; игры и звонки могут идти мимо него.</p>
+          </div>
         </div>
       </div>
       <div class="block about">

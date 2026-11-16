@@ -26,27 +26,101 @@ fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Обёртка скрипта: вывод в UTF-8 (иначе русский текст ошибок приходит в
+/// кодировке консоли и превращается в «�»), и каждая ошибка — одной строкой
+/// `ERR:` с названием шага, на котором она случилась.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wrap_script(body: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8\n\
+         $ErrorActionPreference='Stop'\n\
+         $step='запуск'\n\
+         try {{\n{body}\n}} catch {{ [Console]::Out.WriteLine('ERR:' + $step + ': ' + $_.Exception.Message); exit 1 }}\n"
+    )
+}
+
+/// Скрипт для `-EncodedCommand`: base64 от UTF-16LE. Так текст доходит до
+/// PowerShell без искажений, что бы в нём ни было (кириллица, кавычки, пути).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn encode_command(script: &str) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Текст из вывода PowerShell: UTF-8, а если не получилось — кодировка
+/// консоли Windows для русского языка (CP866).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decode(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes
+            .iter()
+            .map(|&b| match b {
+                0x00..=0x7F => b as char,
+                0x80..=0xAF => char::from_u32(0x0410 + (b - 0x80) as u32).unwrap_or('?'),
+                0xE0..=0xEF => char::from_u32(0x0440 + (b - 0xE0) as u32).unwrap_or('?'),
+                0xF0 => 'Ё',
+                0xF1 => 'ё',
+                _ => '?',
+            })
+            .collect(),
+    }
+}
+
+/// Сеть CIDR без «лишних» битов адреса: 172.19.0.1/30 → 172.19.0.0/30.
+/// Брандмауэр Windows принимает не все записи с битами узла.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn network(cidr: &str) -> String {
+    let Some((ip, bits)) = cidr.split_once('/') else { return cidr.to_string() };
+    let Ok(bits) = bits.parse::<u32>() else { return cidr.to_string() };
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) if bits <= 32 => {
+            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            format!("{}/{bits}", std::net::Ipv4Addr::from(u32::from(a) & mask))
+        }
+        Ok(std::net::IpAddr::V6(a)) if bits <= 128 => {
+            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            format!("{}/{bits}", std::net::Ipv6Addr::from(u128::from(a) & mask))
+        }
+        _ => cidr.to_string(),
+    }
+}
+
 #[cfg(windows)]
-fn run_ps(script: &str) -> Result<String, String> {
+fn run_ps(body: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
+    let script = wrap_script(body);
     let out = std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            script,
+            "-EncodedCommand",
+            &encode_command(&script),
         ])
         .creation_flags(0x0800_0000)
         .output()
         .map_err(|e| format!("не удалось запустить PowerShell: {e}"))?;
+    let stdout = decode(&out.stdout);
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!("брандмауэр Windows: {}", err.lines().next().unwrap_or("ошибка")))
+        return Ok(stdout);
     }
+    let err = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ERR:").map(|e| e.trim().to_string()))
+        .or_else(|| decode(&out.stderr).lines().map(str::trim).find(|l| !l.is_empty()).map(String::from))
+        .unwrap_or_else(|| format!("код {}", out.status.code().unwrap_or(-1)));
+    Err(format!("брандмауэр Windows: {err}"))
 }
 
 /// Включает kill switch. `programs` — исполняемые файлы, которым разрешён прямой
@@ -54,33 +128,41 @@ fn run_ps(script: &str) -> Result<String, String> {
 #[cfg(windows)]
 pub fn enable(data: &Path, programs: &[PathBuf], tun_cidrs: &[&str]) -> Result<Vec<String>, String> {
     let state = state_file(data);
-    let mut script = String::from("$ErrorActionPreference='Stop'\n");
+    let mut script = String::new();
     script += &format!("$g={}\n", ps_quote(GROUP));
+    // Без службы брандмауэра правила не применить — понятная ошибка вместо загадочной.
+    script += "$step='служба брандмауэра'\n\
+               $svc = Get-Service -Name MpsSvc -ErrorAction SilentlyContinue\n\
+               if (-not $svc -or $svc.Status -ne 'Running') { throw 'служба «Брандмауэр Защитника Windows» (MpsSvc) не запущена — возможно, её отключил сторонний антивирус' }\n";
     // Исходную политику сохраняем только один раз, иначе запишем свою же блокировку.
     if !state.exists() {
+        script += "$step='сохранение настроек брандмауэра'\n";
         script += &format!(
             "Get-NetFirewallProfile | Select-Object Name,@{{n='Out';e={{$_.DefaultOutboundAction.ToString()}}}},@{{n='On';e={{[bool]$_.Enabled}}}} | ConvertTo-Json | Set-Content -Encoding UTF8 -Path {}\n",
             ps_quote(&state.to_string_lossy())
         );
     }
+    script += "$step='удаление старых правил'\n";
     script += "Get-NetFirewallRule -Group $g -ErrorAction SilentlyContinue | Remove-NetFirewallRule\n";
     let rule = |name: &str, extra: &str| {
         format!(
-            "New-NetFirewallRule -DisplayName {} -Group $g -Direction Outbound -Action Allow {extra} | Out-Null\n",
+            "$step={}\nNew-NetFirewallRule -DisplayName {} -Group $g -Direction Outbound -Action Allow {extra} | Out-Null\n",
+            ps_quote(&format!("правило «{name}»")),
             ps_quote(&format!("Tunnelka: {name}"))
         )
     };
     script += &rule("loopback", "-RemoteAddress 127.0.0.0/8,::1");
-    script += &rule("локальная сеть", "-RemoteAddress LocalSubnet");
+    script += &rule("local network", "-RemoteAddress LocalSubnet");
     script += &rule("DHCP", "-Protocol UDP -RemotePort 67,547");
     if !tun_cidrs.is_empty() {
-        let list = tun_cidrs.iter().map(|c| ps_quote(c)).collect::<Vec<_>>().join(",");
+        let list = tun_cidrs.iter().map(|c| ps_quote(&network(c))).collect::<Vec<_>>().join(",");
         script += &rule("TUN", &format!("-LocalAddress {list}"));
     }
     for p in programs.iter().filter(|p| p.exists()) {
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         script += &rule(&name, &format!("-Program {}", ps_quote(&p.to_string_lossy())));
     }
+    script += "$step='блокировка исходящих соединений'\n";
     script += "Set-NetFirewallProfile -All -DefaultOutboundAction Block\n";
     // Профили, где брандмауэр выключен: там блокировка не сработает.
     script += "Get-NetFirewallProfile | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name }\n";
@@ -100,6 +182,7 @@ pub fn enable(data: &Path, programs: &[PathBuf], tun_cidrs: &[&str]) -> Result<V
 pub fn disable(data: &Path) -> Result<(), String> {
     let state = state_file(data);
     let mut script = String::from("$ErrorActionPreference='Continue'\n");
+    script += "$step='снятие блокировки'\n";
     script += &format!(
         "Get-NetFirewallRule -Group {} -ErrorAction SilentlyContinue | Remove-NetFirewallRule\n",
         ps_quote(GROUP)
@@ -132,6 +215,18 @@ pub fn disable(data: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn helpers() {
+        assert_eq!(super::network("172.19.0.1/30"), "172.19.0.0/30");
+        assert_eq!(super::network("fdfe:dcba:9876::1/126"), "fdfe:dcba:9876::/126");
+        // «Отказано» в CP866
+        assert_eq!(super::decode(&[0x8E, 0xE2, 0xAA, 0xA0, 0xA7, 0xA0, 0xAD, 0xAE]), "Отказано");
+        assert_eq!(super::decode("ок".as_bytes()), "ок");
+        assert!(super::wrap_script("x").contains("UTF8"));
+        // «ab» в UTF-16LE = 61 00 62 00
+        assert_eq!(super::encode_command("ab"), "YQBiAA==");
+    }
+
     #[test]
     fn quoting() {
         assert_eq!(super::ps_quote("C:\\It's\\x.exe"), "'C:\\It''s\\x.exe'");

@@ -203,6 +203,28 @@ pub fn scan_qr() -> Result<String, String> {
     Err("только для Android".into())
 }
 
+/// Адрес телефона в локальной сети (точка доступа, USB-модем).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LanAddress {
+    pub name: String,
+    pub ip: String,
+}
+
+/// Адреса телефона в локальных сетях (Android).
+pub fn lan_addresses() -> Vec<LanAddress> {
+    #[cfg(target_os = "android")]
+    {
+        #[derive(Deserialize, Default)]
+        struct R {
+            #[serde(default)]
+            list: Vec<LanAddress>,
+        }
+        return imp::call::<_, R>("lanAddresses", ()).unwrap_or_default().list;
+    }
+    #[cfg(not(target_os = "android"))]
+    Vec::new()
+}
+
 /// Открывает настройки уведомлений приложения.
 pub fn open_notification_settings() -> Result<(), String> {
     #[cfg(target_os = "android")]

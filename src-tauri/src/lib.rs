@@ -165,6 +165,14 @@ async fn scan_qr() -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Адреса телефона в сети точки доступа (для настройки прокси на других устройствах).
+#[tauri::command]
+async fn lan_addresses() -> Vec<tauri_plugin_tunnelka_vpn::LanAddress> {
+    tauri::async_runtime::spawn_blocking(tauri_plugin_tunnelka_vpn::lan_addresses)
+        .await
+        .unwrap_or_default()
+}
+
 /// Буфер обмена на Android (в WebView чтение из страницы запрещено).
 #[tauri::command]
 async fn read_clipboard() -> Result<String, String> {
@@ -365,6 +373,7 @@ pub fn run() {
             read_clipboard,
             share_text,
             scan_qr,
+            lan_addresses,
             ping_progress,
             open_url
         ])

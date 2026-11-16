@@ -111,8 +111,18 @@ struct Matchers {
 impl Matchers {
     fn from_entries(entries: &[String]) -> Self {
         let mut m = Matchers::default();
-        for raw in entries {
+        // В строке может быть несколько адресов через запятую или пробел
+        // (кроме регулярных выражений — в них запятая и пробел значимы).
+        let parts = entries.iter().flat_map(|raw| {
             let e = raw.trim();
+            if e.starts_with("regexp:") {
+                vec![e.to_string()]
+            } else {
+                e.split([',', ' ', '\t', ';']).map(|x| x.trim().to_string()).collect()
+            }
+        });
+        for e in parts {
+            let e = e.as_str();
             if e.is_empty() || e.starts_with("//") || e.starts_with('#') {
                 continue;
             }
@@ -172,16 +182,23 @@ fn as_cidr(e: &str) -> Option<String> {
     Some(format!("{addr}/{bits}"))
 }
 
-/// Принимает `youtube.com`, `*.youtube.com`, `.youtube.com`, `https://youtube.com/watch`.
+/// Принимает `youtube.com`, `*.youtube.com`, `.youtube.com`, `*.ru` (все сайты
+/// в зоне .ru), адрес из браузера `https://www.youtube.com/watch?v=…`.
 fn as_host(e: &str) -> Option<String> {
     let mut s = e.to_lowercase();
+    let url = s.contains("://");
     if let Some((_, rest)) = s.split_once("://") {
         s = rest.to_string();
     }
     let s = s.split(['/', '?', '#']).next().unwrap_or("");
     let s = s.rsplit('@').next().unwrap_or(s);
     let s = s.split(':').next().unwrap_or(s);
-    let s = s.trim_start_matches("*.").trim_start_matches('.').trim_end_matches('.');
+    let s = s.trim_start_matches('*').trim_start_matches('.').trim_end_matches('.');
+    // Из адреса сайта «www.» убираем: правило должно касаться всего сайта.
+    let s = match s.strip_prefix("www.") {
+        Some(rest) if url && rest.contains('.') => rest,
+        _ => s,
+    };
     let ok = !s.is_empty()
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_');
@@ -538,6 +555,19 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         r.insert("server".into(), json!("dns-remote"));
         dns_rules.push(Value::Object(r));
     }
+    let mut ru_dns = vec![];
+    if ru_direct {
+        ru_dns.push(json!({"domain_suffix": FOREIGN_RU, "server": "dns-remote"}));
+        ru_dns.push(json!({"domain_suffix": RU_SUFFIXES, "server": "dns-direct"}));
+        if geosite_ru {
+            ru_dns.push(json!({"rule_set": ["geosite-ru"], "server": "dns-direct"}));
+        }
+    }
+    // «Только выбранные приложения через VPN»: российские сайты и у них идут
+    // напрямую, поэтому правила для России — раньше правила приложений.
+    if include_mode {
+        dns_rules.append(&mut ru_dns);
+    }
     if app_split {
         let mut r = apps.clone();
         r.insert(
@@ -546,13 +576,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         );
         dns_rules.push(Value::Object(r));
     }
-    if ru_direct && !include_mode {
-        dns_rules.push(json!({"domain_suffix": FOREIGN_RU, "server": "dns-remote"}));
-        dns_rules.push(json!({"domain_suffix": RU_SUFFIXES, "server": "dns-direct"}));
-        if geosite_ru {
-            dns_rules.push(json!({"rule_set": ["geosite-ru"], "server": "dns-direct"}));
-        }
-    }
+    dns_rules.append(&mut ru_dns);
     let dns = json!({
         "servers": dns_servers,
         "rules": dns_rules,
@@ -588,21 +612,26 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         }
         inbounds.push(m);
     }
-    if st.allow_lan && !st.lan_password.is_empty() {
+    // Раздача VPN через точку доступа (Android): прокси для устройств,
+    // подключённых к телефону. Без пароля — прокси в настройках Wi-Fi пароль не
+    // поддерживают; чужие (не из локальной сети) подключения отклоняются ниже.
+    let lan = android && st.allow_lan && st.lan_port >= 1024;
+    if lan {
         inbounds.push(json!({
             "type": "mixed",
             "tag": "lan-in",
             "listen": "0.0.0.0",
-            "listen_port": st.lan_port,
-            "users": [{"username": "tunnelka", "password": st.lan_password}]
+            "listen_port": st.lan_port
         }));
     }
 
     // ---- маршрутизация ----
-    let mut rules = vec![
-        json!({"action": "sniff"}),
-        json!({"protocol": "dns", "action": "hijack-dns"}),
-    ];
+    let mut rules = vec![];
+    if lan {
+        rules.push(json!({"inbound": ["lan-in"], "source_ip_is_private": false, "action": "reject"}));
+    }
+    rules.push(json!({"action": "sniff"}));
+    rules.push(json!({"protocol": "dns", "action": "hijack-dns"}));
     if !st.ipv6 {
         rules.push(json!({"ip_version": 6, "action": "reject"}));
     }
@@ -623,6 +652,46 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         r.insert("outbound".into(), json!(TAG_PROXY));
         rules.push(Value::Object(r));
     }
+    let mut ru_rules = vec![];
+    if ru_direct {
+        ru_rules.push(json!({"domain_suffix": FOREIGN_RU, "outbound": TAG_PROXY}));
+        ru_rules.push(json!({"domain_suffix": RU_SUFFIXES, "outbound": TAG_DIRECT}));
+        if geosite_ru {
+            ru_rules.push(json!({"rule_set": ["geosite-ru"], "outbound": TAG_DIRECT}));
+        }
+        if geoip_ru {
+            // По российскому IP напрямую — только если имя сайта неизвестно.
+            // Если браузер получил для зарубежного сайта российский адрес
+            // (например, свой «безопасный DNS» отдал сервер Google в российской
+            // сети), решает имя сайта: зарубежный сайт идёт через VPN, а адрес
+            // там найдёт сам сервер. Иначе сайт увидел бы российский IP.
+            ru_rules.push(json!({
+                "type": "logical",
+                "mode": "and",
+                "rules": [
+                    {"rule_set": ["geoip-ru"]},
+                    {"domain_regex": [".+"], "invert": true}
+                ],
+                "outbound": TAG_DIRECT
+            }));
+        }
+    }
+    if include_mode {
+        // Только выбранные приложения идут через VPN, но российские сайты и у
+        // них — напрямую (остальные приложения и так идут напрямую).
+        for mut rule in ru_rules.drain(..) {
+            if rule["outbound"] == json!(TAG_DIRECT) {
+                rules.push(rule);
+            } else {
+                // google.ru и т.п. — через VPN только для выбранных приложений.
+                let o = rule.as_object_mut().unwrap();
+                for (k, v) in apps.iter() {
+                    o.insert(k.clone(), v.clone());
+                }
+                rules.push(rule);
+            }
+        }
+    }
     if app_split {
         if include_mode {
             let mut q = apps.clone();
@@ -638,29 +707,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         );
         rules.push(Value::Object(r));
     }
-    if ru_direct && !include_mode {
-        rules.push(json!({"domain_suffix": FOREIGN_RU, "outbound": TAG_PROXY}));
-        rules.push(json!({"domain_suffix": RU_SUFFIXES, "outbound": TAG_DIRECT}));
-        if geosite_ru {
-            rules.push(json!({"rule_set": ["geosite-ru"], "outbound": TAG_DIRECT}));
-        }
-        if geoip_ru {
-            // По российскому IP напрямую — только если имя сайта неизвестно.
-            // Если браузер получил для зарубежного сайта российский адрес
-            // (например, свой «безопасный DNS» отдал сервер Google в российской
-            // сети), решает имя сайта: зарубежный сайт идёт через VPN, а адрес
-            // там найдёт сам сервер. Иначе сайт увидел бы российский IP.
-            rules.push(json!({
-                "type": "logical",
-                "mode": "and",
-                "rules": [
-                    {"rule_set": ["geoip-ru"]},
-                    {"domain_regex": [".+"], "invert": true}
-                ],
-                "outbound": TAG_DIRECT
-            }));
-        }
-    }
+    rules.append(&mut ru_rules);
 
     // QUIC (UDP 443) через VPN не пускаем: многие серверы (VLESS с XTLS Vision)
     // его отвергают, и браузер долго ждёт, прежде чем перейти на обычный HTTPS.
@@ -786,7 +833,7 @@ mod tests {
         assert!(text.contains("\"Discord.exe\""));
         assert!(!text.contains("chrome.exe"), "список другого режима не должен попадать в конфиг");
         assert!(text.contains("(?i)^C:\\\\\\\\Games\\\\\\\\"), "{text}");
-        assert!(text.contains("\"www.youtube.com\""));
+        assert!(text.contains("\"youtube.com\""));
         assert!(text.contains("\"8.8.8.8/32\""));
         let tun = &cfg["inbounds"][0];
         assert_eq!(tun["type"], "tun");
@@ -815,6 +862,62 @@ mod tests {
         assert_eq!(cfg["inbounds"][0]["type"], "mixed");
         assert_eq!(cfg["inbounds"][0]["listen_port"], 45000);
         assert!(cfg["inbounds"][0].get("users").is_none());
+    }
+
+    #[test]
+    fn include_mode_keeps_russian_sites_direct() {
+        let mut st = Settings::default();
+        st.mode = Mode::Proxy;
+        st.split.app_mode = AppMode::Include;
+        st.split.apps_include = vec!["chrome.exe".into()];
+        st.split.ru_direct = true;
+        let s = servers();
+        let r = rt();
+        let cfg = build(&input(&st, &s, "auto", &r)).unwrap().singbox;
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        let pos = |f: &dyn Fn(&Value) -> bool| rules.iter().position(|r| f(r)).unwrap();
+        let ru = pos(&|r| r["domain_suffix"].to_string().contains("xn--p1ai") && r["outbound"] == "direct");
+        let app = pos(&|r| r["process_name"].is_array() && r["outbound"] == "proxy" && r["domain_suffix"].is_null());
+        assert!(ru < app, "российские сайты должны идти напрямую и у выбранных приложений: {}", serde_json::to_string_pretty(rules).unwrap());
+        // google.ru — через VPN только для выбранных приложений.
+        let g = pos(&|r| r["domain_suffix"].to_string().contains("google.ru"));
+        assert_eq!(rules[g]["process_name"][0], "chrome.exe");
+        let dns = cfg["dns"]["rules"].as_array().unwrap();
+        let ru_dns = dns.iter().position(|r| r["domain_suffix"].to_string().contains("xn--p1ai")).unwrap();
+        let app_dns = dns.iter().position(|r| r["process_name"].is_array()).unwrap();
+        assert!(ru_dns < app_dns);
+    }
+
+    #[test]
+    fn site_entries() {
+        let m = Matchers::from_entries(&[
+            "*.ru".into(),
+            "https://www.sberbank.ru/ru/person?x=1".into(),
+            "http://Example.COM:8080/a".into(),
+            "a.com, b.org  c.net".into(),
+            "www.mail.ru".into(),
+        ]);
+        assert_eq!(m.suffix, vec!["ru", "sberbank.ru", "example.com", "a.com", "b.org", "c.net", "www.mail.ru"]);
+    }
+
+    #[test]
+    fn hotspot_sharing_android_only() {
+        let mut st = Settings::default();
+        st.allow_lan = true;
+        st.lan_port = 2080;
+        let s = servers();
+        let r = rt();
+        let cfg = build(&input(&st, &s, "auto", &r)).unwrap().singbox;
+        assert!(!cfg["inbounds"].to_string().contains("lan-in"), "на ПК раздачи нет");
+        let mut inp = input(&st, &s, "auto", &r);
+        inp.platform = Platform::Android;
+        inp.mode = Mode::Proxy;
+        let cfg = build(&inp).unwrap().singbox;
+        let lan = cfg["inbounds"].as_array().unwrap().iter().find(|i| i["tag"] == "lan-in").unwrap().clone();
+        assert_eq!(lan["listen_port"], 2080);
+        assert!(lan.get("users").is_none());
+        assert_eq!(cfg["route"]["rules"][0]["inbound"][0], "lan-in");
+        assert_eq!(cfg["route"]["rules"][0]["source_ip_is_private"], false);
     }
 
     #[test]
@@ -847,19 +950,6 @@ mod tests {
         assert_eq!(cfg["inbounds"][0]["users"][0]["password"], "p");
         assert_eq!(cfg["dns"]["servers"][1]["type"], "udp");
         assert!(!cfg.to_string().contains("process_name"));
-    }
-
-    #[test]
-    fn lan_sharing_requires_password() {
-        let mut st = Settings::default();
-        st.allow_lan = true;
-        st.lan_password = "pw".into();
-        let s = servers();
-        let r = rt();
-        let cfg = build(&input(&st, &s, "auto", &r)).unwrap().singbox;
-        let lan = cfg["inbounds"].as_array().unwrap().iter().find(|i| i["tag"] == "lan-in").unwrap();
-        assert_eq!(lan["listen"], "0.0.0.0");
-        assert_eq!(lan["users"][0]["password"], "pw");
     }
 
     #[test]
