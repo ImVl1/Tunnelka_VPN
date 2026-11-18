@@ -99,6 +99,10 @@ struct Rt {
     tags: std::collections::HashSet<String>,
     /// Работающий конфиг собран для «белого интернета» (всё через сервер).
     domestic: bool,
+    /// Группы автовыбора: тег → серверы (зарубежные, затем российские).
+    autos: HashMap<String, Vec<String>>,
+    /// Предупреждение показано из-за сбоя связи: убрать, когда связь вернётся.
+    health_notice: bool,
     /// Результаты идущей проверки пинга (приложение показывает их по мере готовности).
     ping_partial: HashMap<String, i64>,
     /// Скачивание обновления: (получено, всего) байт.
@@ -287,6 +291,12 @@ struct VpnProfile {
     tags: Vec<String>,
     #[serde(default)]
     domestic: bool,
+    /// Группы автовыбора и российские серверы: VPN-сервис сам выбирает в них
+    /// рабочий сервер, если текущий перестал отвечать.
+    #[serde(default)]
+    autos: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    domestic_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -788,6 +798,7 @@ impl Engine {
                     rt.groups = p.groups;
                     rt.tags = p.tags.into_iter().collect();
                     rt.domestic = p.domestic;
+                    rt.autos = p.autos;
                     rt.active_sub = Some(p.active_sub);
                     rt.mode = Mode::Tun;
                     rt.last_error = None;
@@ -1103,6 +1114,7 @@ impl Engine {
             let mut rt = self.rt.lock().unwrap();
             rt.tags = config.tags.iter().cloned().collect();
             rt.domestic = config.domestic;
+            rt.autos = config.autos.clone();
             rt.groups = config.groups.clone();
         }
         if config.domestic {
@@ -1369,6 +1381,8 @@ impl Engine {
             names,
             tags: config.tags.clone(),
             domestic: config.domestic,
+            autos: config.autos.clone(),
+            domestic_ids: self.domestic_ids(),
         };
         let path = self.profile_path();
         write_private(&path, &serde_json::to_value(&profile).map_err(|e| e.to_string())?)?;
@@ -1435,10 +1449,22 @@ impl Engine {
     async fn health_watch(self: Arc<Self>, gen: u64) {
         let done = |me: &Self| me.rt.lock().unwrap().checking = false;
 
-        // Сервер с автовыбором внутри: сразу выбираем в нём лучший рабочий сервер.
-        let mut ok = match self.selected_group() {
-            Some(g) => self.tune_group(&g).await,
-            None => false,
+        // Автовыбор: приложение само проверяет серверы группы; первый ответивший
+        // включается сразу, затем — самый быстрый.
+        // Сервер с автовыбором внутри: сразу выбираем в нём лучший рабочий вариант.
+        let mut ok = if let Some(tag) = self.selected_auto_tag() {
+            match self.pick_auto(&tag, true).await {
+                Some(p) => {
+                    self.auto_picked(&p);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            match self.selected_group() {
+                Some(g) => self.tune_group(&g).await,
+                None => false,
+            }
         };
         // Несколько проверок, а не одна — сразу после запуска соединение может
         // ещё устанавливаться.
@@ -1449,10 +1475,6 @@ impl Engine {
             if self.server_delay(TAG_PROXY).await.is_some() {
                 ok = true;
                 break;
-            }
-            if let Some(tag) = self.selected_auto_tag() {
-                let (base, secret) = self.clash_base();
-                let _ = group_delay(&self.http, &base, &secret, &tag).await;
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1539,8 +1561,10 @@ impl Engine {
     /// компьютера интернет есть — восстанавливает связь (см. `recover`).
     async fn monitor(&self, gen: u64) {
         let mut offline_logged = false;
+        let mut round: u32 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
+            round += 1;
             {
                 let rt = self.rt.lock().unwrap();
                 if rt.gen != gen || !Self::live(&rt) {
@@ -1552,6 +1576,16 @@ impl Engine {
             }
             if self.server_delay(TAG_PROXY).await.is_some() {
                 offline_logged = false;
+                self.clear_health_notice();
+                // Автовыбор раз в 10 минут перепроверяет серверы и переходит на
+                // заметно более быстрый (текущее соединение не рвётся без нужды).
+                if round % 20 == 0 {
+                    if let Some(tag) = self.selected_auto_tag() {
+                        if let Some(p) = self.pick_auto(&tag, false).await {
+                            self.auto_picked(&p);
+                        }
+                    }
+                }
                 continue;
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1559,6 +1593,7 @@ impl Engine {
                 continue;
             }
             if self.server_delay(TAG_PROXY).await.is_some() {
+                self.clear_health_notice();
                 continue;
             }
             // Если пропал интернет у самого компьютера, менять сервер бесполезно.
@@ -1604,6 +1639,136 @@ impl Engine {
         }
     }
 
+    /// Российские серверы во всех подписках.
+    fn domestic_ids(&self) -> Vec<String> {
+        let st = self.state.lock().unwrap();
+        st.subscriptions
+            .iter()
+            .flat_map(|s| s.servers.iter())
+            .filter(|s| s.is_domestic())
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Убирает предупреждение о сбое связи, когда связь вернулась.
+    fn clear_health_notice(&self) {
+        let mut rt = self.rt.lock().unwrap();
+        if rt.health_notice {
+            rt.notice = None;
+            rt.health_notice = false;
+        }
+    }
+
+    /// Выбор сервера в группе автовыбора. Серверы проверяются по 16 сразу.
+    /// `eager`: первый ответивший сервер включается сразу (связь появляется через
+    /// доли секунды), а после проверки всех — самый быстрый, если он заметно
+    /// быстрее. Без `eager` (плановая перепроверка) переключение — только если
+    /// лучший быстрее текущего больше чем на 100 мс. Российские серверы
+    /// проверяются, только если не ответил ни один зарубежный.
+    /// Ответ: (сервер, мс, российский ли).
+    async fn pick_auto(&self, tag: &str, eager: bool) -> Option<(String, i64, bool)> {
+        use futures::stream::{self, StreamExt};
+        let (members, groups) = {
+            let rt = self.rt.lock().unwrap();
+            (rt.autos.get(tag).cloned()?, rt.groups.clone())
+        };
+        let domestic: std::collections::HashSet<String> = self.domestic_ids().into_iter().collect();
+        let (foreign, dom): (Vec<String>, Vec<String>) = members.into_iter().partition(|id| !domestic.contains(id));
+        let (base, secret) = self.clash_base();
+        let current = if eager { None } else { self.server_delay(TAG_PROXY).await };
+        let apply = |id: String, part: Option<String>| {
+            let (groups, tag) = (&groups, tag);
+            async move {
+                if self.clash_put(tag, &id).await.is_err() {
+                    return false;
+                }
+                if let (Some(part), true) = (part, groups.contains_key(&id)) {
+                    let _ = self.clash_put(&id, &part).await;
+                }
+                true
+            }
+        };
+        for (set, is_dom) in [(foreign, false), (dom, true)] {
+            if set.is_empty() {
+                continue;
+            }
+            let sem = Arc::new(tokio::sync::Semaphore::new(16));
+            let mut tests = stream::iter(set)
+                .map(|id| {
+                    let sem = sem.clone();
+                    let groups = &groups;
+                    let (base, secret) = (&base, &secret);
+                    async move {
+                        let parts = groups.get(&id).cloned().unwrap_or_else(|| vec![id.clone()]);
+                        let runs = parts.into_iter().map(|m| {
+                            let sem = sem.clone();
+                            async move {
+                                let _permit = sem.acquire_owned().await.ok();
+                                let ms = proxy_delay(&self.http, base, secret, &m, 5000).await.unwrap_or(0);
+                                (m, ms)
+                            }
+                        });
+                        let best = join_all(runs).await.into_iter().filter(|(_, ms)| *ms > 0).min_by_key(|(_, ms)| *ms);
+                        match best {
+                            Some((m, ms)) => (id.clone(), ms, (m != id).then_some(m)),
+                            None => (id, 0, None),
+                        }
+                    }
+                })
+                .buffer_unordered(64);
+            let mut first: Option<(String, i64)> = None;
+            let mut best: Option<(String, i64, Option<String>)> = None;
+            while let Some((id, ms, part)) = tests.next().await {
+                if ms <= 0 {
+                    continue;
+                }
+                if eager && first.is_none() && apply(id.clone(), part.clone()).await {
+                    self.log(format!("[app] автовыбор: подключено через {id} ({ms} мс), проверяю остальные"));
+                    first = Some((id.clone(), ms));
+                }
+                if best.as_ref().map_or(true, |b| ms < b.1) {
+                    best = Some((id, ms, part));
+                }
+            }
+            drop(tests);
+            let Some((id, ms, part)) = best else { continue };
+            let switch = match (&first, current) {
+                (Some((f, fms)), _) => *f != id && ms + 30 < *fms,
+                (None, Some(cur)) if !eager => ms + 100 < cur,
+                _ => true,
+            };
+            if switch && !apply(id.clone(), part).await {
+                continue;
+            }
+            return Some((id, ms, is_dom));
+        }
+        None
+    }
+
+    /// Запись в журнал и предупреждение после выбора сервера автовыбором.
+    fn auto_picked(&self, p: &(String, i64, bool)) {
+        let name = {
+            let st = self.state.lock().unwrap();
+            st.subscriptions
+                .iter()
+                .flat_map(|s| s.servers.iter())
+                .find(|s| s.id == p.0)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| p.0.clone())
+        };
+        self.log(format!("[app] автовыбор: «{name}» ({} мс)", p.1));
+        let mut rt = self.rt.lock().unwrap();
+        if p.2 {
+            rt.notice = Some(format!(
+                "Зарубежные серверы не отвечают — подключено через российский «{name}». Сайты видят российский IP"
+            ));
+            rt.health_notice = true;
+        } else if rt.health_notice {
+            rt.notice = None;
+            rt.health_notice = false;
+        }
+    }
+
     /// Восстанавливает связь, когда выбранный сервер не отвечает. true — получилось.
     async fn recover(&self, gen: u64) -> bool {
         let (base, secret) = self.clash_base();
@@ -1611,17 +1776,20 @@ impl Engine {
             let st = self.state.lock().unwrap();
             Self::selected_name(&st).map(|n| n.0).unwrap_or_default()
         };
-        let set_notice = |me: &Self, text: String| me.rt.lock().unwrap().notice = Some(text);
+        let set_notice = |me: &Self, text: String| {
+            let mut rt = me.rt.lock().unwrap();
+            rt.notice = Some(text);
+            rt.health_notice = true;
+        };
 
         if let Some(tag) = self.selected_auto_tag() {
-            let _ = group_delay(&self.http, &base, &secret, &tag).await;
-            if self.server_delay(TAG_PROXY).await.is_some() {
-                self.log("[app] автовыбор переключился на рабочий сервер");
+            if let Some(p) = self.pick_auto(&tag, true).await {
+                self.auto_picked(&p);
                 self.rt.lock().unwrap().exit = None;
                 self.check_exit().await;
                 return true;
             }
-            set_notice(self, "Ни один сервер автовыбора сейчас не отвечает".into());
+            set_notice(self, "Ни один сервер автовыбора сейчас не отвечает. Приложение продолжит проверять их само".into());
             return false;
         }
         if let Some(g) = self.selected_group() {
@@ -2537,23 +2705,6 @@ async fn proxy_delay(http: &reqwest::Client, base: &str, secret: &str, tag: &str
         .await
         .ok()?;
     v["delay"].as_i64().filter(|d| *d > 0)
-}
-
-/// Проверка всех серверов группы (urltest): sing-box заодно выбирает лучший.
-async fn group_delay(http: &reqwest::Client, base: &str, secret: &str, tag: &str) -> Option<HashMap<String, i64>> {
-    let url = format!("{base}/group/{}/delay?timeout=5000&url={URL_TEST}", enc(tag));
-    let r = http
-        .get(url)
-        .bearer_auth(secret)
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await
-        .ok()?;
-    if !r.status().is_success() {
-        return None;
-    }
-    let v: HashMap<String, serde_json::Value> = r.json().await.ok()?;
-    Some(v.into_iter().map(|(k, d)| (k, d.as_i64().unwrap_or(0))).collect())
 }
 
 /// Временное ядро: адрес Clash API, ключ, локальный прокси и группы серверов.

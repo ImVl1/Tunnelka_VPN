@@ -490,8 +490,12 @@ class TunnelkaVpnService : VpnService() {
     private fun startMonitor() {
         val t = Thread {
             try {
+                // Первая проверка — вскоре после запуска: если VPN включили плиткой
+                // без приложения, автовыбор сразу найдёт рабочий сервер.
+                var first = true
                 while (!Thread.currentThread().isInterrupted) {
-                    Thread.sleep(30_000)
+                    Thread.sleep(if (first) 8_000 else 30_000)
+                    first = false
                     if (state != State.RUNNING) continue
                     val c = clash() ?: continue
                     if (delay(c, "proxy", 6000) > 0) continue
@@ -589,10 +593,22 @@ class TunnelkaVpnService : VpnService() {
         val groups = p.optJSONObject("groups")
         val old = names?.optString(selected)?.takeIf { it.isNotEmpty() } ?: p.optString("server", "сервер")
         if (selected == "auto" || selected.startsWith("auto-")) {
-            http(c, "GET", "/group/${enc(selected)}/delay?timeout=5000&url=${enc(testUrl)}", null, 9000)
-            if (delay(c, "proxy", 6000) > 0) {
-                report(null, "Автовыбор переключился на рабочий сервер", true)
-                return true
+            // Серверы автовыбора проверяем сами: сначала зарубежные, российские —
+            // только если не ответил ни один зарубежный («белые списки»).
+            val members = p.optJSONObject("autos")?.optJSONArray(selected)
+                ?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
+            val dom = p.optJSONArray("domesticIds")
+                ?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } ?: emptySet()
+            for (set in listOf(members.filter { it !in dom }, members.filter { it in dom })) {
+                if (set.isEmpty()) continue
+                val best = testAll(c, set, groups) ?: continue
+                if (!select(c, selected, best.first)) continue
+                best.second?.let { select(c, best.first, it) }
+                if (delay(c, "proxy", 6000) > 0) {
+                    val name = names?.optString(best.first)?.takeIf { it.isNotEmpty() } ?: best.first
+                    report(null, "Автовыбор переключился на «$name»", true)
+                    return true
+                }
             }
             report(null, "Ни один сервер автовыбора сейчас не отвечает", false)
             return false

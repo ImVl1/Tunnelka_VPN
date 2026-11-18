@@ -73,6 +73,8 @@ pub struct Built {
     pub domestic: bool,
     /// Всё, что можно выбрать без переподключения: серверы и группы автовыбора.
     pub tags: Vec<String>,
+    /// Группы автовыбора: тег → серверы (зарубежные, затем российские).
+    pub autos: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Через какое ядро пойдёт сервер.
@@ -395,10 +397,23 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         }
         out
     };
+    // Состав группы автовыбора: сначала зарубежные серверы, в конце российские.
+    // Российский приложение выберет, только если не ответил ни один зарубежный
+    // (например, при «белых списках» у оператора).
+    let auto_all = |ids: &[String]| -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        let ok = || input.servers.iter().copied().filter(|s| ids.contains(&s.id) && tags.contains(&s.id));
+        for s in ok().filter(|s| !s.is_domestic()).chain(ok().filter(|s| s.is_domestic())) {
+            if !out.contains(&s.id) {
+                out.push(s.id.clone());
+            }
+        }
+        out
+    };
     let autos: Vec<(String, Vec<String>)> = input
         .autos
         .iter()
-        .map(|(tag, ids)| (tag.clone(), auto_members(ids)))
+        .map(|(tag, ids)| (tag.clone(), auto_all(ids)))
         .filter(|(_, m)| !m.is_empty())
         .collect();
     let default = if input.default == TAG_AUTO
@@ -422,34 +437,26 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             "interrupt_exist_connections": true
         }),
     );
-    // Автовыбор проверяет свои серверы (включая части групп), только когда
-    // выбран он сам; иначе группа пассивная, чтобы каждое подключение не
-    // начиналось с десятков проверочных соединений. Если выбранный сервер
-    // перестал отвечать, приложение само запускает проверку группы.
+    // Группы автовыбора — простые переключатели: серверы проверяет и лучший
+    // выбирает приложение. Встроенный автовыбор sing-box (urltest) для этого
+    // не годится: пока идёт его фоновая проверка (при сотне серверов — десятки
+    // секунд), запрос проверки группы сразу возвращает пустой ответ.
     let auto_group = |tag: &str, members: &[String]| {
-        if default == tag {
-            json!({
-                "type": "urltest",
-                "tag": tag,
-                "outbounds": members,
-                "url": URL_TEST,
-                "interval": "5m",
-                "tolerance": 50
-            })
-        } else {
-            json!({
-                "type": "selector",
-                "tag": tag,
-                "outbounds": members,
-                "default": members[0],
-                "interrupt_exist_connections": false
-            })
-        }
+        json!({
+            "type": "selector",
+            "tag": tag,
+            "outbounds": members,
+            "default": members[0],
+            "interrupt_exist_connections": false
+        })
     };
     let all_ids: Vec<String> = tags.clone();
-    let mut auto_obs = vec![auto_group(TAG_AUTO, &auto_members(&all_ids))];
+    let mut auto_map = std::collections::HashMap::new();
+    auto_map.insert(TAG_AUTO.to_string(), auto_all(&all_ids));
+    let mut auto_obs = vec![auto_group(TAG_AUTO, &auto_map[TAG_AUTO])];
     for (tag, members) in &autos {
         auto_obs.push(auto_group(tag, members));
+        auto_map.insert(tag.clone(), members.clone());
     }
     for (i, ob) in auto_obs.into_iter().enumerate() {
         outbounds.insert(1 + i, ob);
@@ -462,7 +469,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         let ids: Vec<String> = if default == TAG_AUTO {
             auto_members(&all_ids)
         } else if let Some((_, m)) = autos.iter().find(|(t, _)| *t == default) {
-            m.clone()
+            auto_members(m)
         } else {
             vec![default.clone()]
         };
@@ -767,7 +774,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         "route": route,
         "experimental": experimental
     });
-    Ok(Built { singbox, xray: xray_cfg, groups, domestic: domestic_mode, tags: selector_list })
+    Ok(Built { singbox, xray: xray_cfg, groups, domestic: domestic_mode, tags: selector_list, autos: auto_map })
 }
 
 #[cfg(test)]
@@ -886,6 +893,32 @@ mod tests {
         let ru_dns = dns.iter().position(|r| r["domain_suffix"].to_string().contains("xn--p1ai")).unwrap();
         let app_dns = dns.iter().position(|r| r["process_name"].is_array()).unwrap();
         assert!(ru_dns < app_dns);
+    }
+
+    #[test]
+    fn auto_groups_are_selectors_with_domestic_last() {
+        let st = Settings::default();
+        let s: Vec<Server> = [
+            "vless://u@ru.example.com:443?security=tls&sni=x.com#%F0%9F%87%B7%F0%9F%87%BA%20RU",
+            "vless://u@a.example.com:443?security=reality&pbk=k&sid=1&sni=x.com#A",
+            "hy2://p@b.example.com:443#B",
+        ]
+        .iter()
+        .map(|l| link_to_server(l, "t").unwrap())
+        .collect();
+        assert!(s[0].is_domestic());
+        let r = rt();
+        let mut inp = input(&st, &s, "auto", &r);
+        inp.autos = vec![("auto-t".into(), s.iter().map(|x| x.id.clone()).collect())];
+        let b = build(&inp).unwrap();
+        for tag in ["auto", "auto-t"] {
+            let g = b.singbox["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == tag).unwrap().clone();
+            assert_eq!(g["type"], "selector", "{tag}: автовыбор выбирает приложение");
+            let m: Vec<String> = g["outbounds"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+            assert_eq!(m.last().unwrap(), &s[0].id, "{tag}: российский сервер — последним");
+            assert_eq!(b.autos[tag], m);
+        }
+        assert!(!b.domestic, "при автовыборе с зарубежными серверами — обычные маршруты");
     }
 
     #[test]
