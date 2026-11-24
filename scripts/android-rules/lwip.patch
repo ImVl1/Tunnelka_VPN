@@ -1,0 +1,42 @@
+--- a/src/include/lwip/udp.h
++++ b/src/include/lwip/udp.h
+@@ -87,6 +87,7 @@
+   struct udp_pcb *next;
+ 
+   u8_t flags;
++  int app_route;
+   u8_t pretend_netif_idx;
+   /** ports are in host byte order */
+   u16_t local_port, remote_port;
+--- a/src/core/udp.c
++++ b/src/core/udp.c
+@@ -248,6 +248,12 @@
+   src = lwip_ntohs(udphdr->src);
+   dest = lwip_ntohs(udphdr->dest);
+ 
++  extern int app_rule_lookup(int, const ip_addr_t *, u16_t, const ip_addr_t *, u16_t);
++  int app_route = app_rule_lookup(17, ip_current_src_addr(), src, ip_current_dest_addr(), dest);
++  if (app_route < 0) {
++    pbuf_free(p);
++    goto end;
++  }
+   udp_debug_print(udphdr);
+ 
+   /* print the UDP source and destination */
+@@ -274,7 +280,7 @@
+     LWIP_DEBUGF(UDP_DEBUG, (", %"U16_F")\n", pcb->remote_port));
+ 
+     if (pcb->pretend_netif_idx != NETIF_NO_INDEX) {
+-      if ((pcb->remote_port == src) && ip_addr_cmp(&pcb->remote_ip, ip_current_src_addr())) {
++      if ((pcb->app_route == app_route) && (pcb->remote_port == src) && ip_addr_cmp(&pcb->remote_ip, ip_current_src_addr())) {
+         break;
+       }
+       prev = pcb;
+@@ -470,6 +476,7 @@
+         if (npcb != NULL) {
+           ip_addr_set_ipaddr(&npcb->remote_ip, ip_current_src_addr());
+           npcb->remote_port = src;
++          npcb->app_route = app_route;
+           npcb->flags |= UDP_FLAGS_CONNECTED;
+           npcb->netif_idx = pcb->netif_idx;
+           npcb->pretend_netif_idx = pcb->pretend_netif_idx;

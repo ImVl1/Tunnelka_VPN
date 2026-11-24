@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tunnelka_core::singbox::{self, BuildInput, TAG_AUTO, TAG_PROXY, URL_TEST};
 use tunnelka_core::subscription::{self, Fetched};
 use tunnelka_core::failover::{self, Candidate};
-use tunnelka_core::{auto_tag, AppMode, Mode, Platform, Runtime, Selection, Server, Settings, Subscription};
+use tunnelka_core::{auto_tag, AppMode, AppRoute, Mode, Platform, Runtime, Selection, Server, Settings, Subscription};
 
 use crate::{autostart, killswitch, sysproxy};
 
@@ -268,6 +268,8 @@ struct VpnProfile {
     socks_pass: String,
     app_mode: String,
     apps: Vec<String>,
+    #[serde(default)]
+    app_routes: Vec<AppRoute>,
     work_dir: String,
     log: String,
     env: HashMap<String, String>,
@@ -1365,6 +1367,7 @@ impl Engine {
             }
             .into(),
             apps: split.active_apps().to_vec(),
+            app_routes: split.app_routes.clone(),
             work_dir: dir.to_string_lossy().into_owned(),
             log: self.core_log().to_string_lossy().into_owned(),
             env: HashMap::from([(
@@ -1497,7 +1500,9 @@ impl Engine {
         } else {
             let settings = self.settings();
             let tun = PLATFORM != Platform::Android && self.rt.lock().unwrap().mode == Mode::Tun;
-            if tun && settings.tun_fallback && !self.internet_works().await && self.same_gen(gen) {
+            if tun && settings.tun_fallback && settings.split.app_routes.is_empty()
+                && !self.internet_works().await && self.same_gen(gen)
+            {
                 self.log("[app] в режиме TUN нет интернета — переключаюсь на системный прокси");
                 if let Some(new_gen) = self.fallback_to_proxy().await {
                     let me = self.clone();
@@ -2153,6 +2158,9 @@ impl Engine {
             new.lan_password = old.lan_password.clone();
         }
         new.split.normalize();
+        if PLATFORM == Platform::Windows && new.mode != Mode::Tun && !new.split.app_routes.is_empty() {
+            return Err("для индивидуальных правил приложений включите режим TUN".into());
+        }
         if new.autostart != old.autostart {
             autostart::set(new.autostart, &self.paths.data)?;
         }
@@ -2533,6 +2541,7 @@ impl Engine {
             settings.allow_lan = false;
             settings.log_level = "error".into();
             settings.split.app_mode = AppMode::Off;
+            settings.split.app_routes.clear();
             let refs: Vec<&Server> = servers.iter().collect();
             let n_xray = if self.paths.xray.exists() { singbox::xray_count(&refs, &settings) } else { 0 };
             let mut ports = free_ports(2 + n_xray)?;

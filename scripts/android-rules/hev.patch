@@ -1,0 +1,146 @@
+--- a/src/hev-jni.c
++++ b/src/hev-jni.c
+@@ -19,6 +19,7 @@
+ #include <string.h>
+ 
+ #include "hev-main.h"
++extern int app_rule_fd;
+ 
+ #include "hev-jni.h"
+ 
+@@ -51,13 +52,13 @@
+ static pthread_key_t current_jni_env;
+ 
+ static jboolean native_start_service (JNIEnv *env, jobject thiz,
+-                                      jstring conig_path, jint fd);
++                                      jstring conig_path, jint fd, jint rules);
+ static jboolean native_stop_service (JNIEnv *env, jobject thiz);
+ static jboolean native_is_running (JNIEnv *env, jobject thiz);
+ static jlongArray native_get_stats (JNIEnv *env, jobject thiz);
+ 
+ static JNINativeMethod native_methods[] = {
+-    { "TProxyStartService", "(Ljava/lang/String;I)Z",
++    { "TProxyStartService", "(Ljava/lang/String;II)Z",
+       (void *)native_start_service },
+     { "TProxyStopService", "()Z", (void *)native_stop_service },
+     { "TProxyIsRunning", "()Z", (void *)native_is_running },
+@@ -113,7 +114,7 @@
+ }
+ 
+ static jboolean
+-native_start_service (JNIEnv *env, jobject thiz, jstring config_path, jint fd)
++native_start_service (JNIEnv *env, jobject thiz, jstring config_path, jint fd, jint rules)
+ {
+     const jbyte *bytes;
+     ThreadData *tdata;
+@@ -134,6 +135,7 @@
+     if (!tdata)
+         goto exit;
+     tdata->fd = fd;
++    app_rule_fd = rules;
+ 
+     bytes = (const jbyte *)(*env)->GetStringUTFChars (env, config_path, NULL);
+     if (!bytes) {
+--- a/src/hev-socks5-tunnel.c
++++ b/src/hev-socks5-tunnel.c
+@@ -40,6 +40,7 @@
+ #include "hev-mapped-dns.h"
+ #include "hev-config-const.h"
+ #include "hev-socks5-session-tcp.h"
++#include "app-rule.h"
+ #include "hev-socks5-session-udp.h"
+ 
+ #include "hev-socks5-tunnel.h"
+@@ -171,7 +172,9 @@
+ {
+     HevSocks5Session *s = data;
+ 
+-    hev_socks5_session_run (s);
++    HevListNode *node = hev_socks5_session_get_node (s);
++    HevSocks5SessionData *sd = container_of (node, HevSocks5SessionData, node);
++    hev_socks5_session_run (s, sd->route);
+ 
+     hev_socks5_tunnel_delete_session (hev_socks5_session_get_node (s));
+     hev_object_unref (HEV_OBJECT (s));
+@@ -208,6 +211,12 @@
+     if (!READ_ONCE (run))
+         return ERR_RST;
+ 
++    int route = app_rule_lookup (6, &pcb->remote_ip, pcb->remote_port,
++                                 &pcb->local_ip, pcb->local_port);
++    if (route < 0) {
++        tcp_abort (pcb);
++        return ERR_ABRT;
++    }
+     tcp = hev_socks5_session_tcp_new (pcb, &mutex);
+     if (!tcp)
+         return ERR_MEM;
+@@ -223,6 +232,7 @@
+         (HEV_TUNNEL_OFFLOAD_TCP | HEV_TUNNEL_OFFLOAD_JUMBO))
+         tcp_pcb_set_gso (pcb);
+ 
++    tcp->data.route = route;
+     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
+     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
+     hev_socks5_tunnel_insert_session (node);
+@@ -300,6 +310,7 @@
+         return;
+     }
+ 
++    udp->data.route = pcb->app_route;
+     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
+     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
+     hev_socks5_tunnel_insert_session (node);
+--- a/src/hev-socks5-session.h
++++ b/src/hev-socks5-session.h
+@@ -24,6 +24,7 @@
+ 
+ struct _HevSocks5SessionData
+ {
++    int route;
+     HevListNode node;
+     HevTask *task;
+     HevSocks5Session *self;
+@@ -39,7 +40,7 @@
+ 
+ void *hev_socks5_session_iface (void);
+ 
+-void hev_socks5_session_run (HevSocks5Session *self);
++void hev_socks5_session_run (HevSocks5Session *self, int route);
+ void hev_socks5_session_terminate (HevSocks5Session *self);
+ int hev_socks5_session_idle_wait (HevSocks5Session *self, int released);
+ 
+--- a/src/hev-socks5-session.c
++++ b/src/hev-socks5-session.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <string.h>
++#include <stdio.h>
+ 
+ #include "hev-utils.h"
+ #include "hev-logger.h"
+@@ -19,11 +20,12 @@
+ #include "hev-socks5-session.h"
+ 
+ void
+-hev_socks5_session_run (HevSocks5Session *self)
++hev_socks5_session_run (HevSocks5Session *self, int route)
+ {
+     HevSocks5SessionIface *iface;
+     HevConfigServer *srv;
+     int res;
++    char username[32];
+ 
+     LOG_D ("%p socks5 session run", self);
+ 
+@@ -37,7 +39,8 @@
+     }
+ 
+     if (srv->user && srv->pass) {
+-        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), srv->user,
++        snprintf (username, sizeof username, "app-%d", route);
++        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), route ? username : srv->user,
+                                     srv->pass);
+         LOG_D ("%p socks5 client auth %s:%s", self, srv->user, srv->pass);
+     }

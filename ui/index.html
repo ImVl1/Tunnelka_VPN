@@ -116,7 +116,7 @@
     <section id="view-split" class="view">
       <header class="view-head">
         <div><h2>Правила</h2><p class="lead">Раздельное туннелирование</p></div>
-        <button class="btn primary" id="split-save">Сохранить</button>
+        <span class="hint" id="split-status" role="status"></span>
       </header>
 
       <div class="card block">
@@ -138,6 +138,20 @@
         </div>
       </div>
 
+      <div class="card block">
+        <h3>Индивидуальные правила</h3>
+        <p class="hint">Пока Tunnelka подключена, эти приложения используют назначенный сервер или работают без сети. Индивидуальное правило имеет приоритет над общими правилами. Требуется Android 10+ или режим TUN в Windows.</p>
+        <div id="app-routes"></div>
+        <div class="row">
+          <input id="route-app" aria-label="Приложение для правила" />
+          <select id="route-target" aria-label="Доступ к интернету"></select>
+        </div>
+        <div class="row">
+          <button class="btn" id="route-add">Назначить правило</button>
+          <button class="btn" id="route-pick">Выбрать приложения</button>
+        </div>
+      </div>
+
       <div class="two">
         <div class="card block">
           <h3>Сайты через VPN</h3>
@@ -148,103 +162,113 @@
           <textarea id="direct-domains" rows="7" placeholder="gosuslugi.ru&#10;https://www.sberbank.ru&#10;*.рф&#10;192.168.50.0/24"></textarea>
         </div>
       </div>
-      <p class="hint">По одному на строку или через запятую. Можно вставить адрес из браузера (<code>https://www.site.ru/page</code>) — правило будет для всего сайта вместе с поддоменами. <code>*.ru</code> — все сайты в зоне .ru. Также можно указывать IP и подсети, <code>full:</code>, <code>keyword:</code>, <code>regexp:</code>. Правила для сайтов важнее правил для приложений.</p>
+      <p class="hint">По одному на строку или через запятую. Можно вставить адрес из браузера (<code>https://www.site.ru/page</code>) — правило будет для всего сайта вместе с поддоменами. <code>*.ru</code> — все сайты в зоне .ru. Также можно указывать IP и подсети, <code>full:</code>, <code>keyword:</code>, <code>regexp:</code>. Правила для сайтов имеют приоритет над общим режимом приложений.</p>
 
       <div class="card block">
-        <label class="switch"><input type="checkbox" id="ru-direct" /><span>Российские сайты и IP-адреса напрямую <small>.ru, .рф, .su и базы geosite/geoip. Локальная сеть всегда идёт напрямую.</small></span></label>
+        <label class="switch"><input type="checkbox" id="ru-direct" /><span>Российские сайты и IP-адреса напрямую <small>.ru, .рф, .su и базы geosite/geoip. По умолчанию локальная сеть доступна напрямую.</small></span></label>
       </div>
     </section>
 
     <!-- Настройки -->
     <section id="view-settings" class="view">
       <header class="view-head">
-        <div><h2>Настройки</h2><p class="lead">Запуск, защита и сеть</p></div>
+        <div><h2>Настройки</h2><p class="lead" id="settings-status" aria-live="polite"></p></div>
         <div class="head-actions">
           <button class="btn square" id="update-check" title="Проверить обновления" aria-label="Проверить обновления"><svg><use href="#i-update" /></svg></button>
-          <button class="btn primary" id="settings-save">Сохранить</button>
         </div>
       </header>
 
-      <div class="card block">
-        <h3>Запуск</h3>
-        <label class="switch desktop-only"><input type="checkbox" id="s-autostart" /><span>Запускать вместе с Windows</span></label>
-        <label class="switch"><input type="checkbox" id="s-auto" /><span>Подключаться при запуске приложения</span></label>
+      <div class="settings-categories" role="group" aria-label="Раздел настроек">
+        <button id="category-general" aria-controls="settings-general" aria-pressed="true">Общие</button>
+        <button id="category-privacy" aria-controls="settings-privacy" aria-pressed="false">Защита</button>
+        <button id="category-network" aria-controls="settings-network" aria-pressed="false">Сеть</button>
       </div>
-
-      <div class="card block android-only">
-        <h3>Работа в фоне</h3>
-        <label class="switch"><input type="checkbox" id="s-notify" /><span>Показывать уведомление <small>С кнопками «Пауза» и «Отключить». Если выключить, уведомление свернётся вниз шторки без значка в строке состояния. Значок ключа Android показывает всегда.</small></span></label>
-        <div class="row">
-          <button class="btn" id="open-notify-settings">Настройки уведомлений</button>
-          <button class="btn" id="battery-btn">Не ограничивать в фоне</button>
+      <section class="settings-panel" id="settings-general" aria-labelledby="category-general">
+        <div class="card block">
+          <h3><svg aria-hidden="true"><use href="#i-power" /></svg>Запуск</h3>
+          <label class="switch desktop-only"><input type="checkbox" id="s-autostart" /><span>Запускать вместе с Windows</span></label>
+          <label class="switch"><input type="checkbox" id="s-auto" /><span>Подключаться при запуске приложения</span></label>
         </div>
-        <p class="hint" id="battery-hint"></p>
-        <p class="hint">Чтобы включать VPN из шторки, нажмите «Изменить» в быстрых настройках и перетащите плитку «Tunnelka».</p>
-      </div>
 
-      <div class="card block">
-        <h3>Защита</h3>
-        <label class="switch"><input type="checkbox" id="s-autoswitch" /><span>Если сервер перестал отвечать — переключаться на похожий <small>Пока VPN включён, приложение каждые 30 секунд проверяет, что через сервер есть интернет. Если сервер пропал, выбирается похожий рабочий — в порядке, который можно настроить ниже.</small></span></label>
-        <button class="setting-link" id="order-open" type="button"><span>Как подбирать замену<small id="order-summary"></small></span><svg><use href="#i-right" /></svg></button>
-        <div class="desktop-only">
-          <label class="switch"><input type="checkbox" id="s-killswitch" /><span>Kill switch <small>Брандмауэр Windows пропускает в интернет только трафик через VPN. Если VPN отключится, приложение упадёт или будет закрыто, интернета не будет, пока вы не подключитесь снова или не нажмёте «Разблокировать интернет».</small></span></label>
-          <label class="switch"><input type="checkbox" id="s-fallback" /><span>Если в режиме TUN нет интернета — переключаться на системный прокси</span></label>
+        <div class="card block android-only">
+          <h3><svg aria-hidden="true"><use href="#i-gear" /></svg>Работа в фоне</h3>
+          <label class="switch"><input type="checkbox" id="s-notify" /><span>Показывать уведомление <small>Добавляет в шторку кнопки «Пауза» и «Отключить». При выключении уведомление сворачивается. Системный значок VPN остаётся.</small></span></label>
+          <div class="row">
+            <button class="btn" id="open-notify-settings">Настройки уведомлений</button>
+            <button class="btn" id="battery-btn">Не ограничивать в фоне</button>
+          </div>
+          <p class="hint" id="battery-hint"></p>
+          <p class="hint">Чтобы включать VPN из шторки, нажмите «Изменить» в быстрых настройках и перетащите плитку «Tunnelka».</p>
         </div>
-        <div class="android-only">
-          <p class="hint">Kill switch на Android включается в системе: «Постоянная VPN» и «Блокировать соединения без VPN» для Tunnelka.</p>
-          <div class="row"><button class="btn" id="open-vpn-settings">Открыть настройки VPN</button></div>
-        </div>
-        <label class="switch"><input type="checkbox" id="s-ipv6" /><span>Использовать IPv6 <small>Если выключено, IPv6 блокируется, чтобы не было утечек.</small></span></label>
-      </div>
 
-      <div class="card block form">
-        <h3>Подключение и DNS</h3>
-        <label>Ядро для VLESS / VMess / Trojan
-          <select id="s-core">
-            <option value="auto">Авто: sing-box, Xray для XHTTP</option>
-            <option value="xray">Всегда Xray-core</option>
-          </select>
-        </label>
-        <label>DNS через VPN<input id="s-dns-remote" /></label>
-        <label>DNS напрямую<input id="s-dns-direct" /></label>
-        <label class="desktop-only">Порт системного прокси (0 — случайный)<input id="s-mixed" type="number" min="0" max="65535" /></label>
-        <label>User-Agent для подписок<input id="s-ua" /></label>
-        <label>Подробность журнала
-          <select id="s-log"><option>error</option><option>warn</option><option>info</option><option>debug</option></select>
-        </label>
-      </div>
-
-      <div class="card block android-only">
-        <h3>Раздача VPN через точку доступа</h3>
-        <label class="switch"><input type="checkbox" id="s-lan" /><span>VPN для устройств, подключённых к телефону <small>Ноутбук или другой телефон, подключённый к вашей точке доступа или USB-модему, тоже сможет ходить через VPN — по тем же правилам: российские сайты напрямую (если включено), списки сайтов «через VPN» и «напрямую». Разделение по приложениям на них не действует.</small></span></label>
-        <div id="lan-info">
-          <label>Порт<input id="s-lan-port" type="number" min="1024" max="65535" /></label>
-          <div class="lan-how">
-            <b>Как подключить устройство</b>
-            <ol>
-              <li>Включите точку доступа на телефоне и VPN в Tunnelka.</li>
-              <li>На устройстве откройте настройки Wi-Fi → сеть телефона → <b>Прокси: вручную</b>.</li>
-              <li>Укажите сервер и порт:</li>
-            </ol>
-            <div class="lan-addr" id="lan-addr"></div>
-            <p class="hint">Без этой настройки устройство пользуется интернетом телефона напрямую, мимо VPN. Через прокси идут браузеры и большинство приложений; игры и звонки могут идти мимо него.</p>
+        <div class="block about">
+          <h3><svg aria-hidden="true"><use href="#i-info" /></svg>О приложении <span class="muted" id="app-version"></span></h3>
+          <div class="about-list">
+            <button class="card about-link" data-link="https://imvl1.github.io/Tunnelka_VPN/">
+              <svg><use href="#i-globe" /></svg><span><b>Сайт приложения</b><small>imvl1.github.io/Tunnelka_VPN</small></span><svg class="go"><use href="#i-arrow" /></svg>
+            </button>
+            <button class="card about-link" data-link="https://github.com/ImVl1/Tunnelka_VPN">
+              <svg viewBox="0 0 24 24"><path d="M9 19c-4 1.5-4-2-6-2.5m12 5v-3.5a3 3 0 0 0-.9-2.3c3-.3 6-1.5 6-6.6a5.2 5.2 0 0 0-1.4-3.6 4.8 4.8 0 0 0-.1-3.6s-1.1-.3-3.7 1.4a12.7 12.7 0 0 0-6.6 0C5.7 1.6 4.6 1.9 4.6 1.9a4.8 4.8 0 0 0-.1 3.6A5.2 5.2 0 0 0 3 9.1c0 5.1 3 6.3 6 6.6a3 3 0 0 0-.9 2.3V21" /></svg><span><b>Исходный код на GitHub</b><small>github.com/ImVl1/Tunnelka_VPN</small></span><svg class="go"><use href="#i-arrow" /></svg>
+            </button>
+            <button class="card about-link support" data-link="https://imvl1.github.io/donation/">
+              <svg><use href="#i-heart" /></svg><span><b>Поддержать проект</b></span><svg class="go"><use href="#i-arrow" /></svg>
+            </button>
           </div>
         </div>
-      </div>
-      <div class="block about">
-        <h3>О приложении <span class="muted" id="app-version"></span></h3>
-      <div class="about-list">
-          <button class="card about-link" data-link="https://imvl1.github.io/Tunnelka_VPN/">
-            <svg><use href="#i-globe" /></svg><span><b>Сайт приложения</b><small>imvl1.github.io/Tunnelka_VPN</small></span><svg class="go"><use href="#i-arrow" /></svg>
-          </button>
-          <button class="card about-link" data-link="https://github.com/ImVl1/Tunnelka_VPN">
-            <svg viewBox="0 0 24 24"><path d="M9 19c-4 1.5-4-2-6-2.5m12 5v-3.5a3 3 0 0 0-.9-2.3c3-.3 6-1.5 6-6.6a5.2 5.2 0 0 0-1.4-3.6 4.8 4.8 0 0 0-.1-3.6s-1.1-.3-3.7 1.4a12.7 12.7 0 0 0-6.6 0C5.7 1.6 4.6 1.9 4.6 1.9a4.8 4.8 0 0 0-.1 3.6A5.2 5.2 0 0 0 3 9.1c0 5.1 3 6.3 6 6.6a3 3 0 0 0-.9 2.3V21" /></svg><span><b>Исходный код на GitHub</b><small>github.com/ImVl1/Tunnelka_VPN</small></span><svg class="go"><use href="#i-arrow" /></svg>
-          </button>
-          <button class="card about-link support" data-link="https://imvl1.github.io/donation/">
-            <svg><use href="#i-heart" /></svg><span><b>Поддержать проект</b></span><svg class="go"><use href="#i-arrow" /></svg>
-          </button>
+      </section>
+      <section class="settings-panel" id="settings-privacy" aria-labelledby="category-privacy" hidden>
+        <div class="card block">
+          <h3><svg aria-hidden="true"><use href="#i-split" /></svg>Защита</h3>
+          <label class="switch"><input type="checkbox" id="s-autoswitch" /><span>Автоматическая замена сервера <small>Tunnelka проверяет связь каждые 30 секунд и подбирает замену, если сервер перестал отвечать.</small></span></label>
+          <button class="setting-link" id="order-open" type="button"><span>Как подбирать замену<small id="order-summary"></small></span><svg><use href="#i-right" /></svg></button>
+          <div class="desktop-only">
+            <label class="switch"><input type="checkbox" id="s-killswitch" /><span>Kill switch <small>Брандмауэр Windows пропускает в интернет только трафик через VPN. Если VPN отключится, приложение упадёт или будет закрыто, интернета не будет, пока вы не подключитесь снова или не нажмёте «Разблокировать интернет».</small></span></label>
+            <label class="switch"><input type="checkbox" id="s-fallback" /><span>Резервный системный прокси <small>Если в режиме TUN пропадёт интернет, Tunnelka переключится на прокси. Индивидуальные правила приложений требуют TUN и отключают этот переход.</small></span></label>
+          </div>
+          <div class="android-only">
+            <p class="hint">Kill switch на Android включается в системе: «Постоянная VPN» и «Блокировать соединения без VPN» для Tunnelka.</p>
+            <div class="row"><button class="btn" id="open-vpn-settings">Открыть настройки VPN</button></div>
+          </div>
+          <label class="switch"><input type="checkbox" id="s-ipv6" /><span>Использовать IPv6 <small>Если выключено, IPv6 блокируется, чтобы не было утечек.</small></span></label>
         </div>
-      </div>
+
+      </section>
+      <section class="settings-panel" id="settings-network" aria-labelledby="category-network" hidden>
+        <div class="card block form">
+          <h3><svg aria-hidden="true"><use href="#i-globe" /></svg>Подключение и DNS</h3>
+          <label>Ядро для VLESS / VMess / Trojan
+            <select id="s-core">
+              <option value="auto">Авто: sing-box, Xray для XHTTP</option>
+              <option value="xray">Всегда Xray-core</option>
+            </select>
+          </label>
+          <label>DNS через VPN<input id="s-dns-remote" /></label>
+          <label>DNS напрямую<input id="s-dns-direct" /></label>
+          <label class="desktop-only">Порт системного прокси (0 — случайный)<input id="s-mixed" required type="number" min="0" max="65535" /></label>
+          <label>User-Agent для подписок<input id="s-ua" /></label>
+          <label>Подробность журнала
+            <select id="s-log"><option>error</option><option>warn</option><option>info</option><option>debug</option></select>
+          </label>
+        </div>
+
+        <div class="card block android-only">
+          <h3><svg aria-hidden="true"><use href="#i-split" /></svg>Раздача VPN через точку доступа</h3>
+          <label class="switch"><input type="checkbox" id="s-lan" /><span>VPN для устройств, подключённых к телефону <small>Подключите устройство по Wi-Fi или USB и настройте на нём прокси. Для него действуют правила сайтов.</small></span></label>
+          <div id="lan-info">
+            <label>Порт<input id="s-lan-port" required type="number" min="1024" max="65535" /></label>
+            <div class="lan-how">
+              <b>Как подключить устройство</b>
+              <ol>
+                <li>Включите точку доступа на телефоне и VPN в Tunnelka.</li>
+                <li>На устройстве откройте настройки Wi-Fi → сеть телефона → <b>Прокси: вручную</b>.</li>
+                <li>Укажите сервер и порт:</li>
+              </ol>
+              <div class="lan-addr" id="lan-addr"></div>
+              <p class="hint">Без этой настройки устройство пользуется интернетом телефона напрямую, мимо VPN. Через прокси идут браузеры и большинство приложений; игры и звонки могут идти мимо него.</p>
+            </div>
+          </div>
+        </div>
+      </section>
     </section>
 
     <!-- Журнал -->
@@ -292,12 +316,19 @@
     </form>
   </dialog>
 
-  <!-- Переименование и подтверждения -->
+  <dialog id="rename-dialog" aria-labelledby="rename-title" class="sheet">
+    <form method="dialog">
+      <h3 id="rename-title">Название подписки</h3>
+      <input id="rename-input" aria-labelledby="rename-title" maxlength="80" required />
+      <div class="row end"><button class="btn primary">Готово</button></div>
+    </form>
+  </dialog>
+
+  <!-- Подтверждение удаления -->
   <dialog id="ask-dialog" class="sheet">
     <form method="dialog">
       <h3 id="ask-title"></h3>
       <p class="hint" id="ask-text"></p>
-      <input id="ask-input" />
       <div class="row end"><button class="btn" value="cancel">Отмена</button><button class="btn primary" value="ok" id="ask-ok">OK</button></div>
     </form>
   </dialog>
@@ -321,7 +352,7 @@
       <div class="order" id="order-list"></div>
       <div class="order-last">Остальные серверы — от быстрых к медленным</div>
       <p class="hint">Российские серверы («белый интернет») меняются только на российские, зарубежные — только на зарубежные.</p>
-      <div class="row end"><button class="btn" value="cancel">Отмена</button><button class="btn primary" value="ok" id="order-save">Сохранить</button></div>
+      <div class="row end"><button class="btn primary" value="close">Готово</button></div>
     </form>
   </dialog>
 

@@ -4,7 +4,7 @@
 // Запуск: npm run fetch-android
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, lstatSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,14 +53,40 @@ try {
   // Xray
   const xr = join(tmp, "xr.zip");
   await download(`https://github.com/XTLS/Xray-core/releases/download/v${XRAY}/Xray-android-arm64-v8a.zip`, xr);
-  execFileSync("unzip", ["-q", xr, "-d", join(tmp, "xr")]);
+  mkdirSync(join(tmp, "xr"));
+  if (process.platform === "win32") execFileSync("tar", ["-xf", xr, "-C", join(tmp, "xr")]);
+  else execFileSync("unzip", ["-q", xr, "-d", join(tmp, "xr")]);
   put(find(join(tmp, "xr"), "xray"), "libxray.so");
 
-  // hev-socks5-tunnel (готовая сборка из AAR)
-  const hev = join(tmp, "hev.aar");
-  await download(`https://github.com/heiher/hev-socks5-tunnel/releases/download/${HEV}/hev-socks5-tunnel.aar`, hev);
-  execFileSync("unzip", ["-q", hev, "jni/arm64-v8a/*", "-d", join(tmp, "hev")]);
-  put(join(tmp, "hev", "jni", "arm64-v8a", "libhev-socks5-tunnel.so"), "libhev-socks5-tunnel.so");
+  // The bridge identifies app traffic before tun2socks loses the socket tuple.
+  const hev = join(tmp, "hev");
+  execFileSync("git", ["clone", "--recursive", "--shallow-submodules", "--depth", "1",
+    "--branch", HEV, "https://github.com/heiher/hev-socks5-tunnel", hev], { stdio: "inherit" });
+  if (process.platform === "win32") {
+    // Git for Windows may check out linked headers as plain files.
+    for (const sub of [".", "src/core", "third-part/hev-task-system", "third-part/lwip", "third-part/yaml"]) {
+      const cwd = join(hev, sub);
+      const entries = execFileSync("git", ["ls-files", "--stage", "-z"], { cwd, encoding: "utf8" });
+      for (const entry of entries.split("\0").filter(e => e.startsWith("120000 "))) {
+        const header = join(cwd, entry.split("\t")[1]);
+        if (!lstatSync(header).isSymbolicLink()) {
+          copyFileSync(join(dirname(header), readFileSync(header, "utf8").trim()), header);
+        }
+      }
+    }
+  }
+  const patches = join(root, "scripts", "android-rules");
+  for (const [folder, patch] of [[hev, "hev.patch"], [join(hev, "third-part", "lwip"), "lwip.patch"]]) {
+    execFileSync("git", ["apply", join(patches, patch)], { cwd: folder });
+  }
+  for (const file of ["app-rule.c", "app-rule.h"]) copyFileSync(join(patches, file), join(hev, "src", file));
+  const ndk = process.env.NDK_HOME || process.env.ANDROID_NDK_HOME || process.env.ANDROID_NDK_LATEST_HOME;
+  if (!ndk) throw new Error("Укажите путь к Android NDK в NDK_HOME");
+  execFileSync(join(ndk, process.platform === "win32" ? "ndk-build.cmd" : "ndk-build"),
+    ["-j4", "NDK_PROJECT_PATH=.", "APP_BUILD_SCRIPT=Android.mk", "NDK_APPLICATION_MK=Application.mk",
+      "APP_ABI=arm64-v8a", "APP_PLATFORM=android-24", "APP_MODULES=hev-socks5-tunnel"],
+    { cwd: hev, stdio: "inherit", shell: process.platform === "win32" });
+  put(join(hev, "libs", "arm64-v8a", "libhev-socks5-tunnel.so"), "libhev-socks5-tunnel.so");
 
   // Базы правил для «российские сайты напрямую»
   await download("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs", join(out, "libgeositeru.so"));

@@ -153,7 +153,16 @@ pub enum CoreChoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppRoute {
+    pub app: String,
+    /// None blocks the app. Otherwise the value is a stable server ID.
+    pub server: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SplitTunnel {
+    #[serde(default)]
+    pub app_routes: Vec<AppRoute>,
     #[serde(default)]
     pub app_mode: AppMode,
     /// Приложения для режима «через VPN только выбранные».
@@ -182,6 +191,7 @@ impl Default for SplitTunnel {
     fn default() -> Self {
         Self {
             app_mode: AppMode::Off,
+            app_routes: vec![],
             apps_include: vec![],
             apps_exclude: vec![],
             apps: vec![],
@@ -195,6 +205,11 @@ impl Default for SplitTunnel {
 impl SplitTunnel {
     /// Переносит старый общий список в список текущего режима и чистит дубли.
     pub fn normalize(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.app_routes.retain_mut(|rule| {
+            rule.app = rule.app.trim().to_string();
+            !rule.app.is_empty() && seen.insert(rule.app.to_lowercase())
+        });
         if !self.apps.is_empty() {
             let old = std::mem::take(&mut self.apps);
             let target = match self.app_mode {

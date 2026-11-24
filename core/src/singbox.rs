@@ -522,6 +522,43 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
     let app_split = !apps.is_empty();
     let include_mode = app_split && split.app_mode == AppMode::Include;
 
+    if !android && !split.app_routes.is_empty() && input.mode != Mode::Tun {
+        return Err("для индивидуальных правил приложений включите режим TUN".into());
+    }
+    let mut reject_rules = vec![];
+    let mut pinned_rules = vec![];
+    let mut app_dns_rules = vec![];
+    let mut app_dns_servers = vec![];
+    let mut users = vec![json!({"username": rt.socks_user, "password": rt.socks_pass})];
+    for (index, rule) in split.app_routes.iter().enumerate() {
+        let mut fields = if android {
+            let user = format!("app-{}", index + 1);
+            users.push(json!({"username": user, "password": rt.socks_pass}));
+            Map::from_iter([("auth_user".into(), json!([user]))])
+        } else {
+            process_fields(std::slice::from_ref(&rule.app))
+        };
+        if fields.is_empty() {
+            return Err("пустое имя приложения в индивидуальном правиле".into());
+        }
+        if let Some(id) = rule.server.as_ref().filter(|id| tags.contains(id)) {
+            let dns_tag = format!("dns-app-{id}");
+            if !app_dns_servers.iter().any(|s: &Value| s["tag"] == dns_tag) {
+                let (server, _) = dns_server(&dns_tag, &st.dns_remote, Some(id));
+                app_dns_servers.push(server);
+            }
+            let mut dns_match = fields.clone();
+            dns_match.insert("server".into(), json!(dns_tag));
+            app_dns_rules.push(Value::Object(dns_match));
+            fields.insert("outbound".into(), json!(id));
+            pinned_rules.push(Value::Object(fields));
+        } else {
+            // A removed server must never silently move an app to another exit.
+            fields.insert("action".into(), json!("reject"));
+            reject_rules.push(Value::Object(fields));
+        }
+    }
+
     // ---- DNS ----
     // На Android у отдельного процесса sing-box нет системного резолвера.
     let dns_direct_addr = if android && st.dns_direct.trim().eq_ignore_ascii_case("local") {
@@ -535,7 +572,8 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
     if r_boot || d_boot {
         dns_servers.push(json!({"type": "udp", "tag": "dns-bootstrap", "server": "77.88.8.8"}));
     }
-    let mut dns_rules = vec![];
+    dns_servers.extend(app_dns_servers);
+    let mut dns_rules = app_dns_rules;
     let xray_used = !xray_entries.is_empty();
     if xray_used {
         // Адреса серверов Xray всегда разрешаем напрямую, иначе будет петля:
@@ -615,7 +653,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             "listen_port": rt.mixed_port
         });
         if rt.mixed_auth {
-            m["users"] = json!([{"username": rt.socks_user, "password": rt.socks_pass}]);
+            m["users"] = json!(users);
         }
         inbounds.push(m);
     }
@@ -637,6 +675,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
     if lan {
         rules.push(json!({"inbound": ["lan-in"], "source_ip_is_private": false, "action": "reject"}));
     }
+    rules.extend(reject_rules);
     rules.push(json!({"action": "sniff"}));
     rules.push(json!({"protocol": "dns", "action": "hijack-dns"}));
     if !st.ipv6 {
@@ -648,6 +687,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         // На Android процессы приложения исключены из VPN системой.
         rules.push(json!({"process_name": [input.xray_process.unwrap()], "outbound": TAG_DIRECT}));
     }
+    rules.extend(pinned_rules);
     rules.push(json!({"ip_is_private": true, "outbound": TAG_DIRECT}));
     if !direct_m.is_empty(true) {
         let mut r = direct_m.fields(true);
@@ -732,7 +772,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         // На Android приложению недоступен netlink, а исключение из VPN
         // обеспечивает сама система.
         route["auto_detect_interface"] = json!(true);
-        if app_split || xray_used {
+        if app_split || xray_used || !split.app_routes.is_empty() {
             route["find_process"] = json!(true);
         }
     }
@@ -816,6 +856,46 @@ mod tests {
             mode: st.mode,
             platform: Platform::Windows,
             runtime: r,
+        }
+    }
+
+    #[test]
+    fn individual_routes_precede_domain_and_split_rules() {
+        use crate::model::AppRoute;
+        let servers = servers();
+        let mut st = Settings::default();
+        st.split.app_mode = AppMode::Exclude;
+        st.split.apps_exclude = vec!["reader".into()];
+        st.split.app_routes = vec![
+            AppRoute { app: "game".into(), server: None },
+            AppRoute { app: "reader".into(), server: Some(servers[1].id.clone()) },
+            AppRoute { app: "stale".into(), server: Some("deleted".into()) },
+        ];
+        let mut runtime = rt();
+        runtime.mixed_port = 12345;
+        runtime.mixed_auth = true;
+        for platform in [Platform::Windows, Platform::Android] {
+            let mut params = input(&st, &servers, &servers[0].id, &runtime);
+            params.platform = platform;
+            let cfg = build(&params).unwrap().singbox;
+            let rules = cfg["route"]["rules"].as_array().unwrap();
+            let android = platform == Platform::Android;
+            let field = if android { "auth_user" } else { "process_name" };
+            let app = |i: usize| if android { ["app-1", "app-2", "app-3"][i] } else { ["game", "reader", "stale"][i] };
+            let position = |key: &str, value: &str| rules.iter().position(|r| r[key] == value).unwrap();
+            for index in [0, 2] {
+                assert!(rules[..position("action", "sniff")].iter().any(|r| r[field][0] == app(index) && r["action"] == "reject"));
+            }
+            let pin = position("outbound", &servers[1].id);
+            assert_eq!(rules[pin][field][0], app(1));
+            assert!(pin < position("outbound", TAG_DIRECT));
+            assert_eq!(cfg["dns"]["rules"][0][field][0], app(1));
+            if android {
+                assert_eq!(cfg["inbounds"][0]["users"][2]["username"], "app-2");
+            } else {
+                params.mode = Mode::Proxy;
+                assert!(build(&params).is_err());
+            }
         }
     }
 

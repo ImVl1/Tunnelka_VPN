@@ -1,9 +1,12 @@
 name: Site
 
-# Сайт с кнопками загрузки (GitHub Pages). Ссылки на файлы берутся
-# из последнего релиза при открытии страницы, поэтому пересобирать сайт
-# после каждого релиза не нужно.
+# После публикации релиза обновляем Pages. Правки самого сайта можно
+# публиковать отдельно, не ожидая сборки установщиков.
 on:
+  workflow_run:
+    workflows: [Build]
+    branches: [main]
+    types: [completed]
   push:
     branches: [main]
     paths: ["site/**", "assets/**", ".github/workflows/main.yml"]
@@ -20,12 +23,20 @@ concurrency:
 
 jobs:
   deploy:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')))
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
       - run: |
           cp assets/icon.png site/icon.png
           cp -r assets/screenshots site/screenshots

@@ -359,8 +359,7 @@ dialog .row.end { margin-top: var(--s-4); }
 .menu button.danger { color: var(--bad); border-color: rgba(248, 113, 113, .3); }
 .qr { background: #fff; border-radius: var(--r-m); padding: 14px; width: min(300px, 70vw); margin: 4px auto 10px; }
 .qr svg { display: block; width: 100%; height: auto; }
-#ask-input { width: 100%; margin: var(--s-2) 0 0; }
-#ask-dialog[data-mode="confirm"] #ask-input { display: none; }
+#rename-input { width: 100%; margin: var(--s-2) 0 0; }
 .setting-link {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; text-align: left;
   padding: 10px 0 var(--s-3) 50px; border: 0; background: none; color: var(--text); cursor: pointer;
@@ -545,3 +544,59 @@ body.p-android .row.android-only { display: flex; }
 
 .block.about { padding: var(--s-5) 0 0; }
 .block.about h3 { padding-left: var(--s-5); }
+
+/* Settings use the same reading order in the desktop window and the mobile WebView. */
+.settings-categories {
+  display: inline-flex; gap: 4px; padding: 4px; margin-bottom: 18px;
+  background: var(--field); border: 1px solid var(--line-2); border-radius: 13px;
+}
+.settings-categories button {
+  min-width: 92px; min-height: 38px; padding: 0 16px; background: transparent;
+  border: 1px solid transparent; border-radius: 9px; color: var(--muted); font-weight: 550;
+}
+.settings-categories button:hover { color: var(--text); }
+.settings-categories button[aria-pressed="true"] {
+  color: #f2e9ff; background: #33263f; border-color: #594368;
+}
+.settings-panel > .card { background: linear-gradient(120deg, #19171d, #141418 65%); }
+.settings-panel h3 {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+  font-size: 17px; letter-spacing: -.025em;
+}
+.settings-panel h3 > svg {
+  flex: none; width: 32px; height: 32px; padding: 7px; border-radius: 10px;
+  background: #302638; fill: none; stroke: #d6b0f4; stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.settings-panel .switch {
+  flex-direction: row-reverse; justify-content: space-between; align-items: center;
+  gap: 18px; min-height: 52px; padding: 12px 0;
+}
+.settings-panel .switch small, .settings-panel .hint, .settings-panel .setting-link small { color: #aaa4b1; line-height: 1.5; }
+.settings-panel .setting-link {
+  padding: 12px 14px; margin: 2px 0 12px; border: 1px solid var(--line);
+  border-radius: 10px; background: rgba(255,255,255,.035);
+}
+.settings-panel .setting-link:hover:enabled { border-color: var(--line-2); }
+.settings-panel .form label { min-width: 0; }
+.settings-panel #lan-info { padding-left: 0; }
+#view-settings .view-head { align-items: center; margin-bottom: 18px; }
+#settings-status:empty { margin: 0; }
+#app-version { margin-left: auto; font-size: 13px; letter-spacing: normal; }
+main { min-width: 0; }
+#app-routes .row > span { min-width: 0; overflow-wrap: anywhere; }
+.chip { max-width: 100%; height: auto; min-height: 30px; overflow-wrap: anywhere; }
+.chip button { flex-shrink: 0; }
+@media (max-width: 700px) {
+  #view-settings .view-head { position: sticky; top: 0; z-index: 2; padding: 8px 0; background: var(--bg); }
+  .settings-panel :is(input, select, button) { scroll-margin-block: 80px 100px; }
+  .settings-categories { display: flex; }
+  .settings-categories button { flex: 1; min-width: 0; min-height: 42px; }
+  .settings-panel h3 { font-size: 16px; }
+  .settings-panel .about-link small { overflow-wrap: anywhere; }
+  #view-settings .head-actions { gap: 5px; }
+  #view-settings .head-actions .btn.primary { padding: 0 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .view.active { animation: none; }
+}

@@ -287,6 +287,8 @@ class TunnelkaVpnService : VpnService() {
         ""
     }
 
+    private var appRouter: AppRouter? = null
+
     private fun startTunnel(p: JSONObject) {
         val port = p.getInt("socksPort")
         val user = p.optString("socksUser")
@@ -313,7 +315,17 @@ class TunnelkaVpnService : VpnService() {
             )
         }
 
-        val selected = apps.filter { it.isNotEmpty() && it != packageName }
+        val routes = p.optJSONArray("appRoutes") ?: JSONArray()
+        val packages = (0 until routes.length()).map { routes.getJSONObject(it).getString("app") }
+        if (packages.isNotEmpty()) {
+            require(Build.VERSION.SDK_INT >= 29) { "Индивидуальные правила требуют Android 10 или новее" }
+            appRouter = AppRouter(this, routes)
+        }
+        val selected = when (appMode) {
+            "include" -> apps + packages
+            "exclude" -> apps.filter { appRouter?.covers(it) != true }
+            else -> apps
+        }.distinct().filter { it.isNotEmpty() && it != packageName }
         if (appMode == "include" && selected.isNotEmpty()) {
             var added = 0
             for (a in selected) {
@@ -359,7 +371,7 @@ class TunnelkaVpnService : VpnService() {
             |  log-level: warn
             |""".trimMargin()
         )
-        if (!TProxyService.TProxyStartService(config.absolutePath, pfd.fd)) {
+        if (!TProxyService.TProxyStartService(config.absolutePath, pfd.fd, appRouter?.fd ?: -1)) {
             error("не удалось запустить туннель")
         }
         hevRunning = true
@@ -378,6 +390,7 @@ class TunnelkaVpnService : VpnService() {
         watchdog = null
         monitor?.interrupt()
         monitor = null
+        appRouter?.shutdown()
         if (hevRunning) {
             try {
                 TProxyService.TProxyStopService()
@@ -386,6 +399,8 @@ class TunnelkaVpnService : VpnService() {
             }
             hevRunning = false
         }
+        appRouter?.close()
+        appRouter = null
         File(cacheDir, "tunnel.yml").delete()
         try {
             tun?.close()

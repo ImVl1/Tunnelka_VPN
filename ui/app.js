@@ -53,7 +53,10 @@ async function call(cmd, args, okMsg) {
 }
 
 async function reload() {
-  data = await invoke("get_state");
+  const version = settingsVersion;
+  const state = await invoke("get_state");
+  if (version !== settingsVersion) state.settings = data.settings;
+  data = state;
   if (!activeSub || !data.subscriptions.some((s) => s.id === activeSub)) {
     activeSub = selectedSubId() ?? data.subscriptions[0]?.id ?? null;
   }
@@ -82,8 +85,16 @@ function selectedSubId() {
 // ---------------------------------------------------------------------------
 
 function show(v) {
+  if (v !== view) {
+    flushSettings();
+    $("main").scrollTop = 0;
+  }
   view = v;
-  $$("nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === v));
+  $$("nav button").forEach((b) => {
+    b.classList.toggle("active", b.dataset.view === v);
+    if (b.dataset.view === v) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
+  });
   $$(".view").forEach((s) => s.classList.toggle("active", s.id === `view-${v}`));
   if (v === "logs") loadLogs();
   render();
@@ -144,7 +155,7 @@ function renderHome() {
   notice.textContent = status?.notice ?? "";
   $("#unblock").hidden = on || !status?.kill_switch_active;
   $("#current-name").textContent = status?.selected_name ?? "Не выбран — добавьте подписку";
-  const mode = data?.settings.mode ?? "tun";
+  const mode = settingsEdits.mode ?? data?.settings.mode ?? "tun";
   $$("[data-mode]").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
   $("#mode-hint").textContent = MODE_HINT[mode];
   renderSideOnly();
@@ -168,12 +179,10 @@ $("#unblock").onclick = async () => {
   renderHome();
 };
 
-$$("[data-mode]").forEach((b) => (b.onclick = async () => {
-  if (data.settings.mode === b.dataset.mode) return;
-  const settings = { ...data.settings, mode: b.dataset.mode };
-  await call("save_settings", { settings }, status?.running ? "Режим изменён, подключение перезапущено" : "Режим изменён");
-  await reload();
-}));
+$$("button[data-mode]").forEach(b => b.onclick = () => {
+  editSetting("mode", b.dataset.mode);
+  renderHome();
+});
 
 async function poll() {
   try {
@@ -380,22 +389,47 @@ function showQr(sub) {
   $("#qr-dialog").showModal();
 }
 
-/** Окно с вопросом: строка ввода (rename) или подтверждение. */
-function ask({ title, text = "", value = null, ok = "OK", danger = false }) {
-  return new Promise((resolve) => {
+function ask({ title, text, ok, danger }) {
+  return new Promise(resolve => {
     const d = $("#ask-dialog");
-    d.dataset.mode = value === null ? "confirm" : "input";
     $("#ask-title").textContent = title;
     $("#ask-text").textContent = text;
-    $("#ask-text").hidden = !text;
-    $("#ask-input").value = value ?? "";
     $("#ask-ok").textContent = ok;
     $("#ask-ok").classList.toggle("danger", danger);
-    d.onclose = () => resolve(d.returnValue === "ok" ? (value === null ? true : $("#ask-input").value) : null);
+    d.onclose = () => resolve(d.returnValue === "ok");
     d.returnValue = "";
     d.showModal();
-    if (value !== null) setTimeout(() => $("#ask-input").select(), 50);
   });
+}
+
+let renameQueue = Promise.resolve();
+function renameSubscription(sub) {
+  const dialog = $("#rename-dialog");
+  const input = $("#rename-input");
+  let timer;
+  let saved = sub.name;
+  input.value = saved;
+  function commit() {
+    clearTimeout(timer);
+    const name = input.value.trim();
+    if (!name) return;
+    renameQueue = renameQueue.then(async () => {
+      if (name === saved) return;
+      await call("rename_subscription", { id: sub.id, name });
+      saved = name;
+      await reload();
+    }).catch(() => {}); // call() displays the error; subsequent edits can retry.
+  }
+  input.oninput = () => {
+    input.setCustomValidity(input.value.trim() ? "" : "Введите название подписки");
+    clearTimeout(timer);
+    timer = setTimeout(commit, 800);
+  };
+  input.setCustomValidity("");
+  dialog.onclose = commit;
+  input.onblur = commit;
+  dialog.showModal();
+  input.select();
 }
 
 function openSubMenu(sub) {
@@ -420,10 +454,7 @@ function openSubMenu(sub) {
     if (act === "qr") showQr(sub);
     if (act === "site") openUrl(sub.web_page_url);
     if (act === "support") openUrl(sub.support_url);
-    if (act === "rename") {
-      const name = await ask({ title: "Новое название", value: sub.name, ok: "Сохранить" });
-      if (name?.trim()) { await call("rename_subscription", { id: sub.id, name }); await reload(); }
-    }
+    if (act === "rename") renameSubscription(sub);
     if (act === "delete") {
       const yes = await ask({ title: `Удалить «${sub.name}»?`, text: "Серверы этой подписки пропадут из списка. Её можно будет добавить снова по ссылке.", ok: "Удалить", danger: true });
       if (!yes) return;
@@ -515,8 +546,10 @@ const APP_TEXT = {
 let appLabels = {};  // id → название (для Android)
 
 function renderSplit() {
-  if (!splitDraft) splitDraft = structuredClone(data.settings.split);
+  if (!splitDraft) splitDraft = structuredClone(settingsEdits.split ?? data.settings.split);
   const t = APP_TEXT[platform];
+  renderAppRoutes();
+  $("#route-app").placeholder = t.placeholder;
   $$("#app-mode input").forEach((i) => (i.checked = i.value === splitDraft.app_mode));
   const off = splitDraft.app_mode === "off";
   $("#apps-box").hidden = off;
@@ -526,7 +559,7 @@ function renderSplit() {
     $("#apps").innerHTML = list
       .map((a, i) => `<span class="chip" title="${esc(a)}">${esc(appLabels[a] ?? a)}<button data-i="${i}" aria-label="Убрать">×</button></span>`)
       .join("") || `<span class="muted">Приложения не выбраны</span>`;
-    $$("#apps button").forEach((b) => (b.onclick = () => { appList().splice(+b.dataset.i, 1); renderSplit(); }));
+    $$("#apps button").forEach((b) => (b.onclick = () => { appList().splice(+b.dataset.i, 1); splitChanged(); }));
   }
   $("#app-input").placeholder = t.placeholder;
   $("#app-pick").textContent = t.pick;
@@ -536,11 +569,11 @@ function renderSplit() {
   $("#ru-direct").checked = splitDraft.ru_direct;
 }
 
-$$("#app-mode input").forEach((i) => (i.onchange = () => { splitDraft.app_mode = i.value; renderSplit(); }));
-$("#ru-direct").onchange = (e) => (splitDraft.ru_direct = e.target.checked);
+$$("#app-mode input").forEach((i) => (i.onchange = () => { splitDraft.app_mode = i.value; splitChanged(); }));
+$("#ru-direct").onchange = (e) => { splitDraft.ru_direct = e.target.checked; splitChanged(); };
 const lines = (s) => s.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-$("#proxy-domains").oninput = (e) => (splitDraft.proxy_domains = lines(e.target.value));
-$("#direct-domains").oninput = (e) => (splitDraft.direct_domains = lines(e.target.value));
+$("#proxy-domains").oninput = (e) => { splitDraft.proxy_domains = lines(e.target.value); editSetting("split", structuredClone(splitDraft), 800); };
+$("#direct-domains").oninput = (e) => { splitDraft.direct_domains = lines(e.target.value); editSetting("split", structuredClone(splitDraft), 800); };
 
 function addApp(name) {
   name = name.trim();
@@ -552,41 +585,82 @@ function removeApp(name) {
   const i = list.findIndex((a) => a.toLowerCase() === name.toLowerCase());
   if (i >= 0) list.splice(i, 1);
 }
-$("#app-add").onclick = () => { addApp($("#app-input").value); $("#app-input").value = ""; renderSplit(); };
+$("#app-add").onclick = () => { addApp($("#app-input").value); $("#app-input").value = ""; splitChanged(); };
 $("#app-input").onkeydown = (e) => { if (e.key === "Enter") $("#app-add").click(); };
 
+function renderAppRoutes() {
+  const servers = new Map();
+  for (const sub of data.subscriptions) {
+    for (const server of sub.servers) {
+      if (server.xray || server.outbound) servers.set(server.id, sub.name + " · " + server.name);
+    }
+  }
+  const select = $("#route-target");
+  const selected = select.value;
+  select.innerHTML = '<option value="">Без интернета</option>' + [...servers].map(([id, label]) =>
+    `<option value="${esc(id)}">${esc(label)}</option>`).join("");
+  if (servers.has(selected)) select.value = selected;
+  $("#app-routes").innerHTML = splitDraft.app_routes.map((r, i) =>
+    `<div class="row"><span>${esc(appLabels[r.app] ?? r.app)} → ${esc(r.server ? servers.get(r.server) ?? "Сервер недоступен · без интернета" : "Без интернета")}</span>
+    <button class="btn" data-i="${i}" aria-label="Удалить правило">Удалить</button></div>`).join("");
+  $$("#app-routes button").forEach(b => b.onclick = () => {
+    splitDraft.app_routes.splice(+b.dataset.i, 1);
+    splitChanged();
+  });
+}
+
+function setAppRoute(app) {
+  app = app.trim();
+  if (!app) return;
+  const server = $("#route-target").value || null;
+  const existing = splitDraft.app_routes.find(r => r.app.toLowerCase() === app.toLowerCase());
+  if (existing) existing.server = server;
+  else splitDraft.app_routes.push({ app, server });
+}
+$("#route-add").onclick = () => {
+  setAppRoute($("#route-app").value);
+  $("#route-app").value = "";
+  splitChanged();
+};
+let pickingRoutes = false;
 let procs = [];
 function renderProcs() {
   const f = $("#proc-filter").value.toLowerCase();
-  const chosen = new Set(appList().map((a) => a.toLowerCase()));
+  const selected = pickingRoutes ? splitDraft.app_routes.filter(r => (r.server || "") === $("#route-target").value).map(r => r.app) : appList();
+  const chosen = new Set(selected.map((a) => a.toLowerCase()));
   $("#proc-list").innerHTML = procs
     .filter((p) => !f || p.label.toLowerCase().includes(f) || (p.detail ?? "").toLowerCase().includes(f))
     .map((p) => `<label><input type="checkbox" value="${esc(p.id)}" ${chosen.has(p.id.toLowerCase()) ? "checked" : ""} />${esc(p.label)}<small>${esc(p.detail ?? "")}</small></label>`)
     .join("") || `<div class="empty">Ничего не найдено</div>`;
   $$("#proc-list input").forEach((i) => (i.onchange = () => {
-    if (i.checked) addApp(i.value); else removeApp(i.value);
-    renderSplit();
+    if (pickingRoutes) {
+      if (i.checked) setAppRoute(i.value);
+      else splitDraft.app_routes = splitDraft.app_routes.filter(r => r.app.toLowerCase() !== i.value.toLowerCase());
+    } else if (i.checked) {
+      addApp(i.value);
+    } else {
+      removeApp(i.value);
+    }
+    splitChanged();
   }));
 }
-$("#app-pick").onclick = async () => {
+$("#route-pick").onclick = () => openAppPicker(true);
+$("#app-pick").onclick = () => openAppPicker(false);
+async function openAppPicker(routes) {
+  pickingRoutes = routes;
   $("#proc-title").textContent = APP_TEXT[platform].title;
   procs = await call("list_apps");
   for (const p of procs) appLabels[p.id] = p.label;
   $("#proc-filter").value = "";
   renderProcs();
   $("#proc-dialog").showModal();
-};
+}
 $("#proc-filter").oninput = renderProcs;
 
-$("#split-save").onclick = async () => {
-  if (splitDraft.app_mode !== "off" && !appList().length) {
-    return toast("Добавьте хотя бы одно приложение или выберите «Не разделять по приложениям»", true);
-  }
-  const settings = { ...data.settings, split: splitDraft };
-  await call("save_settings", { settings }, status?.running ? "Сохранено, подключение перезапущено" : "Сохранено");
-  splitDraft = null;
-  await reload();
-};
+function splitChanged() {
+  editSetting("split", structuredClone(splitDraft));
+  renderSplit();
+}
 
 // ---------------------------------------------------------------------------
 // настройки
@@ -601,6 +675,132 @@ const CHECKS = [
   ["#s-killswitch", "kill_switch"], ["#s-fallback", "tun_fallback"], ["#s-notify", "notification"],
   ["#s-autoswitch", "auto_switch"],
 ];
+
+const settingsEdits = {};
+let saveTimer;
+let savingSettings = false;
+let saveError = "";
+const savedSections = new Set();
+let settingsVersion = 0;
+
+function validationError(key, value) {
+  if (key === "split" && value.app_mode !== "off") {
+    const list = value.app_mode === "include" ? value.apps_include : value.apps_exclude;
+    if (!list.length) return "Выберите хотя бы одно приложение";
+  }
+  if (key === "mixed_port" || key === "lan_port") {
+    if (key === "mixed_port" && value === 0) return "";
+    if (!Number.isInteger(value) || value < 1024 || value > 65535)
+      return key === "mixed_port" ? "Допустимый порт — 0 или 1024–65535" : "Допустимый порт — 1024–65535";
+  }
+  return "";
+}
+
+// A mobile WebView can be stopped before the debounce timer or IPC completes.
+const pendingKey = "tunnelka.pending-settings.v1";
+function pendingChanges() {
+  return Object.fromEntries(Object.entries(settingsEdits).filter(([key, value]) => !validationError(key, value)));
+}
+
+function rememberChanges() {
+  try {
+    const pending = pendingChanges();
+    if (Object.keys(pending).length) localStorage.setItem(pendingKey, JSON.stringify(pending));
+    else localStorage.removeItem(pendingKey);
+  } catch { /* In-memory autosave still works if storage is unavailable. */ }
+}
+
+function resumeChanges() {
+  try {
+    const pending = JSON.parse(localStorage.getItem(pendingKey) || "{}");
+    for (const [key, value] of Object.entries(pending)) {
+      if (Object.hasOwn(data.settings, key) && !Object.hasOwn(settingsEdits, key) && !validationError(key, value))
+        settingsEdits[key] = value;
+    }
+  } catch { /* Ignore an unreadable draft. */ }
+  if (Object.keys(settingsEdits).length) flushSettings();
+}
+
+function updateSaveStatus() {
+  for (const [id, rules] of [["#settings-status", false], ["#split-status", true]]) {
+    const edits = Object.entries(settingsEdits).filter(([key]) => (key === "split") === rules);
+    const error = edits.map(([key, value]) => validationError(key, value)).find(Boolean);
+    $(id).textContent = error || (edits.length ? saveError || "Сохранение…" : savedSections.has(rules) ? "Сохранено" : "");
+  }
+}
+
+function editSetting(key, value, delay = 0) {
+  settingsEdits[key] = value;
+  rememberChanges();
+  saveError = "";
+  updateSaveStatus();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSettings, delay);
+}
+
+async function flushSettings() {
+  clearTimeout(saveTimer);
+  saveTimer = undefined;
+  if (savingSettings || !data) return;
+  const changes = pendingChanges();
+  if (!Object.keys(changes).length) return;
+  const next = { ...data.settings, ...changes };
+  for (const [key, value] of Object.entries(changes)) {
+    if (typeof value === "string") next[key] = value.trim();
+  }
+  savingSettings = true;
+  let succeeded = false;
+  try {
+    if (Object.keys(changes).some(k => JSON.stringify(next[k]) !== JSON.stringify(data.settings[k]))) {
+      await invoke("save_settings", { settings: next });
+      data.settings = next;
+      settingsVersion++;
+    }
+    for (const [key, value] of Object.entries(changes)) {
+      savedSections.add(key === "split");
+      if (settingsEdits[key] === value) delete settingsEdits[key];
+    }
+    saveError = "";
+    succeeded = true;
+  } catch (err) {
+    saveError = "Ошибка сохранения";
+    toast(String(err), true);
+    // The backend can persist settings before reporting a restart failure.
+    try { await reload(); } catch { /* Keep the draft for a retry. */ }
+  } finally {
+    savingSettings = false;
+    rememberChanges();
+    updateSaveStatus();
+    if (view === "home") renderHome();
+    const revised = Object.entries(settingsEdits).some(([k,v]) =>
+      !validationError(k,v) && (succeeded || !(k in changes) || changes[k] !== v));
+    if (revised && saveTimer === undefined) flushSettings();
+  }
+}
+document.addEventListener("visibilitychange", () => { if (document.hidden) flushSettings(); });
+window.addEventListener("pagehide", flushSettings);
+
+function selectCategory(button) {
+  for (const b of $$(".settings-categories button")) {
+    const active = b === button;
+    b.setAttribute("aria-pressed", String(active));
+    document.getElementById(b.getAttribute("aria-controls")).hidden = !active;
+  }
+}
+$$(".settings-categories button").forEach(b => b.onclick = () => selectCategory(b));
+
+for (const [sel, key, convert] of FIELDS) {
+  $(sel).addEventListener("blur", flushSettings);
+  $(sel).addEventListener("input", e => {
+    const raw = e.target.value;
+    const value = convert && raw !== "" ? convert(raw) : raw;
+    e.target.setCustomValidity(validationError(key, value));
+    editSetting(key, value, e.target.tagName === "SELECT" ? 0 : 800);
+  });
+}
+for (const [sel, key] of CHECKS) {
+  $(sel).addEventListener("change", e => editSetting(key, e.target.checked));
+}
 
 const ORDER = {
   type: ["Такой же тип подключения", "например, VLESS XHTTP → VLESS XHTTP в другой стране"],
@@ -623,14 +823,14 @@ function renderOrder() {
       <button type="button" class="icon" data-up="${i}" ${i === 0 ? "disabled" : ""} aria-label="Выше"><svg><use href="#i-up" /></svg></button>
       <button type="button" class="icon" data-down="${i}" ${i === orderDraft.length - 1 ? "disabled" : ""} aria-label="Ниже"><svg><use href="#i-down" /></svg></button>
     </div>`).join("");
-  $$("#order-list input").forEach((c) => (c.onchange = () => { orderDraft[+c.dataset.i][1] = c.checked; renderOrder(); }));
-  const move = (i, d) => { const [x] = orderDraft.splice(i, 1); orderDraft.splice(i + d, 0, x); renderOrder(); };
+  $$("#order-list input").forEach((c) => (c.onchange = () => { orderDraft[+c.dataset.i][1] = c.checked; orderChanged(); }));
+  const move = (i, d) => { const [x] = orderDraft.splice(i, 1); orderDraft.splice(i + d, 0, x); orderChanged(); };
   $$("[data-up]").forEach((b) => (b.onclick = () => move(+b.dataset.up, -1)));
   $$("[data-down]").forEach((b) => (b.onclick = () => move(+b.dataset.down, 1)));
 }
 
 function orderFromSettings() {
-  const on = (data.settings.switch_order ?? []).filter((k) => ORDER[k]);
+  const on = (settingsEdits.switch_order ?? data.settings.switch_order ?? []).filter((k) => ORDER[k]);
   return [...on.map((k) => [k, true]), ...Object.keys(ORDER).filter((k) => !on.includes(k)).map((k) => [k, false])];
 }
 
@@ -639,26 +839,32 @@ $("#order-open").onclick = () => {
   renderOrder();
   $("#order-dialog").showModal();
 };
-$("#order-dialog").onclose = async () => {
-  if ($("#order-dialog").returnValue !== "ok") return;
-  $("#order-dialog").returnValue = "";
-  const settings = { ...data.settings, switch_order: orderDraft.filter(([, v]) => v).map(([k]) => k) };
-  await call("save_settings", { settings }, "Сохранено");
-  await reload();
-};
+function orderChanged() {
+  editSetting("switch_order", orderDraft.filter(([, v]) => v).map(([k]) => k), 350);
+  $("#order-summary").textContent = orderSummary(orderFromSettings());
+  renderOrder();
+}
+$("#order-dialog").onclose = flushSettings;
 $("#s-autoswitch").onchange = (e) => ($("#order-open").disabled = !e.target.checked);
 
 function renderSettings() {
-  const s = data.settings;
+  const s = { ...data.settings, ...settingsEdits };
+  updateSaveStatus();
   $("#order-summary").textContent = orderSummary(orderFromSettings());
   $("#order-open").disabled = !s.auto_switch;
-  for (const [sel, key] of FIELDS) if (document.activeElement !== $(sel)) $(sel).value = s[key];
+  for (const [sel, key] of FIELDS) if ($(sel).value !== String(s[key])) $(sel).value = s[key];
   for (const [sel, key] of CHECKS) $(sel).checked = s[key];
   $("#lan-info").hidden = !s.allow_lan;
   if (s.allow_lan) showLanAddresses(s.lan_port);
   if (isAndroid() && !renderSettings.battery) { renderSettings.battery = true; renderBattery(); }
 }
 $("#s-lan").onchange = (e) => {
+  if (!e.target.checked && validationError("lan_port", settingsEdits.lan_port)) {
+    delete settingsEdits.lan_port;
+    $("#s-lan-port").value = data.settings.lan_port;
+    $("#s-lan-port").setCustomValidity("");
+    updateSaveStatus();
+  }
   $("#lan-info").hidden = !e.target.checked;
   if (e.target.checked) showLanAddresses(+$("#s-lan-port").value || data.settings.lan_port);
 };
@@ -736,13 +942,6 @@ $("#update-go").onclick = async () => {
   }
 };
 
-$("#settings-save").onclick = async () => {
-  const s = { ...data.settings };
-  for (const [sel, key, conv] of FIELDS) s[key] = conv ? conv($(sel).value) : $(sel).value.trim();
-  for (const [sel, key] of CHECKS) s[key] = $(sel).checked;
-  await call("save_settings", { settings: s }, "Настройки сохранены");
-  await reload();
-};
 $("#open-vpn-settings").onclick = () => call("open_vpn_settings");
 $("#open-notify-settings").onclick = () => call("open_notification_settings");
 $("#battery-btn").onclick = async () => { await call("open_battery_settings"); setTimeout(renderBattery, 1500); };
@@ -812,6 +1011,7 @@ function render() {
     document.body.classList.add(`p-${platform}`);
     window.__TAURI__?.app?.getVersion?.().then((v) => ($("#app-version").textContent = v)).catch(() => {});
     await reload();
+    resumeChanges();
   } catch (e) {
     toast(String(e), true);
   }
