@@ -580,7 +580,7 @@ body.p-android .row.android-only { display: flex; }
 .settings-panel .setting-link:hover:enabled { border-color: var(--line-2); }
 .settings-panel .form label { min-width: 0; }
 .settings-panel #lan-info { padding-left: 0; }
-#view-settings .view-head { align-items: center; margin-bottom: 18px; }
+#view-settings .view-head { position: sticky; top: 0; z-index: 2; align-items: center; margin-bottom: 18px; }
 #settings-status:empty { margin: 0; }
 #app-version { margin-left: auto; font-size: 13px; letter-spacing: normal; }
 main { min-width: 0; }
@@ -588,7 +588,7 @@ main { min-width: 0; }
 .chip { max-width: 100%; height: auto; min-height: 30px; overflow-wrap: anywhere; }
 .chip button { flex-shrink: 0; }
 @media (max-width: 700px) {
-  #view-settings .view-head { position: sticky; top: 0; z-index: 2; padding: 8px 0; background: var(--bg); }
+  #view-settings .view-head { padding: 8px 0; }
   .settings-panel :is(input, select, button) { scroll-margin-block: 80px 100px; }
   .settings-categories { display: flex; }
   .settings-categories button { flex: 1; min-width: 0; min-height: 42px; }
@@ -600,3 +600,21 @@ main { min-width: 0; }
 @media (prefers-reduced-motion: reduce) {
   .view.active { animation: none; }
 }
+
+.server-search { margin: var(--s-2) 0 var(--s-3); }
+.result-heading { margin: var(--s-3) 0 var(--s-1); color: var(--muted); }
+.picker-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.picker-head h3 { margin: 0; }
+.picker-back svg { transform: rotate(180deg); }
+.btn.target-trigger { max-width: 100%; height: auto; min-height: var(--h-md); justify-content: space-between; }
+.target-trigger span { overflow-wrap: anywhere; white-space: normal; text-align: left; line-height: 1.4; }
+.target-trigger svg { flex: none; }
+.target-list { margin-top: 12px; max-height: min(55vh, 440px); overflow: auto; }
+.target-list details { border-top: 1px solid var(--line); }
+.target-list summary, .target-list button { padding: 12px; min-height: 44px; cursor: pointer; overflow-wrap: anywhere; }
+.target-list summary { font-weight: 600; }
+.target-list button { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: transparent; border: 0; border-radius: 8px; width: 100%; text-align: left; }
+.target-list details button { padding-left: 24px; }
+.target-list button:hover, .target-list button[aria-pressed="true"] { background: var(--card-2); }
+.target-list button[aria-pressed="true"] { color: var(--violet); }
+.target-list small { color: var(--muted); }

@@ -244,8 +244,19 @@ function paintPings() {
 
 const usableCount = () => data.subscriptions.filter((s) => s.servers.some((x) => x.outbound || x.xray)).length;
 
+function matchingServers(sub, query) {
+  const words = query.toLowerCase().trim().split(/\s+/);
+  return sub.servers.filter(server => {
+    const text = [sub.name, server.name, server.address, server.protocol, server.transport].join(" ").toLowerCase();
+    return words.every(word => text.includes(word));
+  });
+}
+$("#server-search").oninput = renderServers;
+
 function renderServers() {
   const subs = data.subscriptions;
+  const query = $("#server-search").value.trim();
+  for (const id of ["#auto-all", "#sub-tabs", "#sub-card"]) $(id).hidden = !!query;
   // «Автовыбор+» — поверх всех подписок.
   $("#auto-all").innerHTML = usableCount() > 1 ? `
       <div class="srv plus ${data.selected === "auto+" ? "sel" : ""}" data-id="auto+">
@@ -302,7 +313,7 @@ function renderServers() {
   const autoId = `auto:${sub.id}`;
   const usable = sub.servers.filter((s) => s.outbound || s.xray);
   const rows = [];
-  if (usable.length > 1) {
+  if (!query && usable.length > 1) {
     rows.push(`
       <div class="srv ${data.selected === autoId ? "sel" : ""}" data-id="${esc(autoId)}">
         <span class="dot"></span>
@@ -310,18 +321,22 @@ function renderServers() {
         <span class="proto"></span><span class="ping"></span><span></span>
       </div>`);
   }
-  for (const s of sub.servers) {
-    const ok = !!(s.outbound || s.xray);
-    rows.push(`
-      <div class="srv ${ok ? "" : "disabled"} ${data.selected === s.id ? "sel" : ""}" data-id="${esc(s.id)}" ${ok ? "" : `title="${esc(s.error)}"`}>
-        <span class="dot"></span>
-        <span class="name">${esc(s.name)}${ok ? "" : `<small>${esc(s.error)}</small>`}</span>
-        <span class="proto">${esc(s.protocol)}${s.transport ? ` · ${esc(s.transport)}` : ""}${s.xray && !s.outbound ? ` <b class="xr" title="Работает через ядро Xray">Xray</b>` : ""}</span>
-        ${ok ? pingCell(s) : `<span class="ping"></span>`}
-        ${sub.id === "manual" ? `<button class="icon" data-del="${esc(s.id)}" title="Удалить сервер">✕</button>` : "<span></span>"}
-      </div>`);
+  for (const group of query ? subs : [sub]) {
+    const matches = query ? matchingServers(group, query) : group.servers;
+    if (query && matches.length) rows.push(`<h3 class="result-heading">${esc(group.name)}</h3>`);
+    for (const s of matches) {
+      const ok = !!(s.outbound || s.xray);
+      rows.push(`
+        <div class="srv ${ok ? "" : "disabled"} ${data.selected === s.id ? "sel" : ""}" data-id="${esc(s.id)}" ${ok ? "" : `title="${esc(s.error)}"`}>
+          <span class="dot"></span>
+          <span class="name">${esc(s.name)}${ok ? "" : `<small>${esc(s.error)}</small>`}</span>
+          <span class="proto">${esc(s.protocol)}${s.transport ? ` · ${esc(s.transport)}` : ""}${s.xray && !s.outbound ? ` <b class="xr" title="Работает через ядро Xray">Xray</b>` : ""}</span>
+          ${ok ? pingCell(s) : `<span class="ping"></span>`}
+          ${group.id === "manual" ? `<button class="icon" data-del="${esc(s.id)}" title="Удалить сервер">✕</button>` : "<span></span>"}
+        </div>`);
+    }
   }
-  $("#server-list").innerHTML = rows.join("") || `<div class="empty">В подписке нет серверов</div>`;
+  $("#server-list").innerHTML = rows.join("") || `<div class="empty">${query ? "Серверы не найдены" : "В подписке нет серверов"}</div>`;
   $$("#server-list .srv:not(.disabled), #auto-all .srv").forEach((r) => (r.onclick = async (e) => {
     if (e.target.closest("[data-del]")) return;
     status = await call("select_server", { id: r.dataset.id });
@@ -596,10 +611,8 @@ function renderAppRoutes() {
     }
   }
   const select = $("#route-target");
-  const selected = select.value;
-  select.innerHTML = '<option value="">Без интернета</option>' + [...servers].map(([id, label]) =>
-    `<option value="${esc(id)}">${esc(label)}</option>`).join("");
-  if (servers.has(selected)) select.value = selected;
+  if (!servers.has(select.value)) select.value = "";
+  select.querySelector("span").textContent = servers.get(select.value) ?? "Без интернета";
   $("#app-routes").innerHTML = splitDraft.app_routes.map((r, i) =>
     `<div class="row"><span>${esc(appLabels[r.app] ?? r.app)} → ${esc(r.server ? servers.get(r.server) ?? "Сервер недоступен · без интернета" : "Без интернета")}</span>
     <button class="btn" data-i="${i}" aria-label="Удалить правило">Удалить</button></div>`).join("");
@@ -608,6 +621,60 @@ function renderAppRoutes() {
     splitChanged();
   });
 }
+
+const pickerListeners = new WeakMap();
+function releasePicker(dialog) {
+  const registration = pickerListeners.get(dialog);
+  pickerListeners.delete(dialog);
+  if (registration) registration.then(listener => listener.unregister()).catch(err => toast(String(err), true));
+}
+function closePicker(dialog) {
+  if (dialog.open) dialog.close();
+  releasePicker(dialog);
+}
+function openPicker(dialog) {
+  dialog.showModal();
+  if (!isAndroid()) return;
+  const registration = window.__TAURI__.app.onBackButtonPress(() => closePicker(dialog));
+  pickerListeners.set(dialog, registration);
+  registration.catch(err => toast(String(err), true));
+}
+$$(".picker-back").forEach(button => {
+  const dialog = button.closest("dialog");
+  button.onclick = () => closePicker(dialog);
+  dialog.addEventListener("close", () => { if (!dialog.open) releasePicker(dialog); });
+});
+
+function renderTargetList() {
+  const query = $("#target-search").value.trim();
+  const target = $("#route-target").value;
+  const groups = [];
+  if (!query || "без интернета".includes(query.toLowerCase())) {
+    groups.push(`<button type="button" data-target="" aria-pressed="${!target}">Без интернета</button>`);
+  }
+  for (const sub of data.subscriptions) {
+    const matches = matchingServers(sub, query).filter(server => server.outbound || server.xray);
+    if (!matches.length) continue;
+    const expand = query || matches.some(server => server.id === target) || data.subscriptions.length === 1;
+    groups.push(`<details ${expand ? "open" : ""}><summary>${esc(sub.name)} <small>${matches.length}</small></summary>
+      ${matches.map(server => `<button type="button" data-target="${esc(server.id)}" aria-pressed="${server.id === target}">
+        <span>${esc(server.name)}</span><small>${esc(server.protocol)}</small></button>`).join("")}</details>`);
+  }
+  $("#target-list").innerHTML = groups.join("") || '<div class="empty">Серверы не найдены</div>';
+}
+$("#route-target").onclick = () => {
+  $("#target-search").value = "";
+  renderTargetList();
+  openPicker($("#target-dialog"));
+};
+$("#target-search").oninput = renderTargetList;
+$("#target-list").onclick = e => {
+  const button = e.target.closest("[data-target]");
+  if (!button) return;
+  $("#route-target").value = button.dataset.target;
+  renderAppRoutes();
+  closePicker($("#target-dialog"));
+};
 
 function setAppRoute(app) {
   app = app.trim();
@@ -622,6 +689,7 @@ $("#route-add").onclick = () => {
   $("#route-app").value = "";
   splitChanged();
 };
+let appRequest = 0;
 let pickingRoutes = false;
 let procs = [];
 function renderProcs() {
@@ -649,11 +717,21 @@ $("#app-pick").onclick = () => openAppPicker(false);
 async function openAppPicker(routes) {
   pickingRoutes = routes;
   $("#proc-title").textContent = APP_TEXT[platform].title;
-  procs = await call("list_apps");
-  for (const p of procs) appLabels[p.id] = p.label;
+  const dialog = $("#proc-dialog");
   $("#proc-filter").value = "";
-  renderProcs();
-  $("#proc-dialog").showModal();
+  $("#proc-list").textContent = "Загрузка приложений…";
+  procs = [];
+  const request = ++appRequest;
+  openPicker(dialog);
+  try {
+    const list = await call("list_apps");
+    if (!dialog.open || request !== appRequest) return;
+    procs = list;
+    for (const p of procs) appLabels[p.id] = p.label;
+    renderProcs();
+  } catch {
+    if (dialog.open && request === appRequest) dialog.close();
+  }
 }
 $("#proc-filter").oninput = renderProcs;
 

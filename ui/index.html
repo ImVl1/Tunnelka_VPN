@@ -106,6 +106,7 @@
           <button class="btn android-only-inline" id="scan-btn"><svg><use href="#i-scan" /></svg>Сканировать QR</button>
         </div>
       </div>
+      <input class="server-search" type="search" id="server-search" aria-label="Поиск по всем подпискам" placeholder="Поиск серверов по всем подпискам" />
       <div class="list auto-all" id="auto-all"></div>
       <div class="pills tabs" id="sub-tabs"></div>
       <div id="sub-card"></div>
@@ -130,8 +131,8 @@
           <p class="hint" id="apps-caption"></p>
           <div class="chips" id="apps"></div>
           <div class="row">
-            <input id="app-input" />
-            <button class="btn" id="app-add">Добавить</button>
+            <input class="desktop-only" id="app-input" />
+            <button class="btn desktop-only" id="app-add">Добавить</button>
             <button class="btn" id="app-pick"></button>
           </div>
           <p class="hint" id="apps-hint"></p>
@@ -143,11 +144,11 @@
         <p class="hint">Пока Tunnelka подключена, эти приложения используют назначенный сервер или работают без сети. Индивидуальное правило имеет приоритет над общими правилами. Требуется Android 10+ или режим TUN в Windows.</p>
         <div id="app-routes"></div>
         <div class="row">
-          <input id="route-app" aria-label="Приложение для правила" />
-          <select id="route-target" aria-label="Доступ к интернету"></select>
+          <input class="desktop-only" id="route-app" aria-label="Приложение для правила" />
+          <button type="button" class="btn target-trigger" id="route-target" value="" aria-haspopup="dialog" aria-controls="target-dialog"><span>Без интернета</span><svg><use href="#i-down" /></svg></button>
         </div>
         <div class="row">
-          <button class="btn" id="route-add">Назначить правило</button>
+          <button class="btn desktop-only" id="route-add">Назначить правило</button>
           <button class="btn" id="route-pick">Выбрать приложения</button>
         </div>
       </div>
@@ -288,9 +289,21 @@
     </section>
   </main>
 
-  <dialog id="proc-dialog">
+  <dialog id="target-dialog" aria-labelledby="target-title">
+    <div class="picker-head">
+      <button class="btn square picker-back" type="button" aria-label="Назад"><svg><use href="#i-right" /></svg></button>
+      <h3 id="target-title">Доступ к интернету</h3>
+    </div>
+    <input type="search" id="target-search" placeholder="Сервер или подписка" aria-label="Поиск сервера или подписки" />
+    <div class="target-list" id="target-list"></div>
+  </dialog>
+
+  <dialog id="proc-dialog" aria-labelledby="proc-title">
     <form method="dialog">
-      <h3 id="proc-title">Запущенные программы</h3>
+      <div class="picker-head">
+        <button class="btn square picker-back" type="button" aria-label="Назад"><svg><use href="#i-right" /></svg></button>
+        <h3 id="proc-title">Запущенные программы</h3>
+      </div>
       <input id="proc-filter" placeholder="Поиск" />
       <div id="proc-list" class="proc-list"></div>
       <div class="row end"><button class="btn primary" value="close">Готово</button></div>

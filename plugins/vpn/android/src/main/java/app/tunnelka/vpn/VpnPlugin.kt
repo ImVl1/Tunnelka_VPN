@@ -326,6 +326,7 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun scanQr(invoke: Invoke) {
         try {
             val intent = com.journeyapps.barcodescanner.ScanOptions()
+                .setCaptureActivity(QrScannerActivity::class.java)
                 .setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
                 .setPrompt("Наведите камеру на QR-код подписки или сервера")
                 .setBeepEnabled(false)
