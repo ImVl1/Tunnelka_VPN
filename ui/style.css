@@ -580,9 +580,9 @@ body.p-android .row.android-only { display: flex; }
 .settings-panel .setting-link:hover:enabled { border-color: var(--line-2); }
 .settings-panel .form label { min-width: 0; }
 .settings-panel #lan-info { padding-left: 0; }
-#view-settings .view-head { position: sticky; top: 0; z-index: 2; align-items: center; margin-bottom: 18px; }
+#view-settings .view-head { align-items: center; margin-bottom: 18px; }
 #settings-status:empty { margin: 0; }
-#app-version { margin-left: auto; font-size: 13px; letter-spacing: normal; }
+#app-version { margin-left: 0; font-size: 13px; letter-spacing: normal; }
 main { min-width: 0; }
 #app-routes .row > span { min-width: 0; overflow-wrap: anywhere; }
 .chip { max-width: 100%; height: auto; min-height: 30px; overflow-wrap: anywhere; }

@@ -889,7 +889,7 @@ let orderDraft = [];  // [[ключ, включён]]
 
 function orderSummary(list) {
   const on = list.filter(([, v]) => v).map(([k]) => ORDER[k][0].toLowerCase());
-  return [...on, "остальные по скорости"].join(" → ").replace(/^./, (c) => c.toUpperCase());
+  return [...on, "остальные серверы"].join(" → ").replace(/^./, (c) => c.toUpperCase());
 }
 
 function renderOrder() {

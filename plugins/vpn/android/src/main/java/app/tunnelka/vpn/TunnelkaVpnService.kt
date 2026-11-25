@@ -513,10 +513,10 @@ class TunnelkaVpnService : VpnService() {
                     first = false
                     if (state != State.RUNNING) continue
                     val c = clash() ?: continue
-                    if (delay(c, "proxy", 6000) > 0) continue
-                    Thread.sleep(3_000)
+                    if (delay(c, "proxy", 3500) > 0) continue
+                    Thread.sleep(800)
                     if (state != State.RUNNING) continue
-                    if (delay(c, "proxy", 6000) > 0) continue
+                    if (delay(c, "proxy", 3500) > 0) continue
                     // Пропал интернет у самого телефона — менять сервер бесполезно.
                     if (!ownInternet()) continue
                     Log.w(TAG, "сервер перестал отвечать")
@@ -582,7 +582,7 @@ class TunnelkaVpnService : VpnService() {
         }
     }
 
-    /** Лучший рабочий вариант: (тег сервера, лучший вариант внутри, мс). */
+    /** Первый ответивший вариант: (тег сервера, лучший вариант внутри, мс). */
     private fun testAll(c: Clash, ids: List<String>, groups: JSONObject?): Triple<String, String?, Int>? {
         val jobs = ids.flatMap { id ->
             val m = groups?.optJSONArray(id)
@@ -591,11 +591,15 @@ class TunnelkaVpnService : VpnService() {
         if (jobs.isEmpty()) return null
         val pool = Executors.newFixedThreadPool(minOf(16, jobs.size))
         return try {
-            val futures = jobs.map { (id, tag) -> pool.submit<Triple<String, String, Int>> { Triple(id, tag, delay(c, tag, 5000)) } }
-            futures.mapNotNull { try { it.get() } catch (_: Exception) { null } }
-                .filter { it.third > 0 }
-                .minByOrNull { it.third }
-                ?.let { Triple(it.first, if (it.first != it.second) it.second else null, it.third) }
+            val completed = java.util.concurrent.ExecutorCompletionService<Triple<String, String, Int>>(pool)
+            for ((id, tag) in jobs) {
+                completed.submit(java.util.concurrent.Callable { Triple(id, tag, delay(c, tag, 3000)) })
+            }
+            repeat(jobs.size) {
+                val (id, tag, ms) = completed.take().get()
+                if (ms > 0) return Triple(id, tag.takeIf { it != id }, ms)
+            }
+            null
         } finally {
             pool.shutdownNow()
         }
@@ -617,9 +621,10 @@ class TunnelkaVpnService : VpnService() {
             for (set in listOf(members.filter { it !in dom }, members.filter { it in dom })) {
                 if (set.isEmpty()) continue
                 val best = testAll(c, set, groups) ?: continue
+                if (profile !== p || Thread.currentThread().isInterrupted) return false
+                if (best.second?.let { select(c, best.first, it) } == false) continue
                 if (!select(c, selected, best.first)) continue
-                best.second?.let { select(c, best.first, it) }
-                if (delay(c, "proxy", 6000) > 0) {
+                if (delay(c, "proxy", 3500) > 0) {
                     val name = names?.optString(best.first)?.takeIf { it.isNotEmpty() } ?: best.first
                     report(null, "Автовыбор переключился на «$name»", true)
                     return true
@@ -630,7 +635,7 @@ class TunnelkaVpnService : VpnService() {
         }
         if (groups?.has(selected) == true) {
             val best = testAll(c, listOf(selected), groups)
-            if (best?.second != null && select(c, selected, best.second!!) && delay(c, "proxy", 6000) > 0) return true
+            if (best?.second != null && select(c, selected, best.second!!) && delay(c, "proxy", 3500) > 0) return true
         }
         if (!p.optBoolean("autoSwitch", true)) {
             report(null, "«$old» не отвечает — выберите другой сервер", false)
@@ -643,8 +648,9 @@ class TunnelkaVpnService : VpnService() {
             val tier = tiers.getJSONArray(i)
             val ids = (0 until tier.length()).map { tier.getString(it) }.filter { it in tags }
             val best = testAll(c, ids, groups) ?: continue
+            if (profile !== p || Thread.currentThread().isInterrupted) return false
+            if (best.second?.let { select(c, best.first, it) } == false) continue
             if (!select(c, "proxy", best.first)) continue
-            best.second?.let { select(c, best.first, it) }
             val name = names?.optString(best.first)?.takeIf { it.isNotEmpty() } ?: best.first
             p.put("selected", best.first)
             p.put("server", name)
