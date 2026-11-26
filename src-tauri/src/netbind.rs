@@ -57,8 +57,8 @@ fn bind_interface(_sock: &socket2::Socket, _idx: u32, _v4: bool) -> Option<()> {
 #[cfg(windows)]
 fn physical_index() -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, FreeMibTable, GetIpForwardTable2,
-        MIB_IPFORWARD_TABLE2,
+        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, FreeMibTable,
+        GetIpForwardTable2, GetIpInterfaceEntry, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows_sys::Win32::Networking::WinSock::AF_INET;
@@ -77,11 +77,31 @@ fn physical_index() -> Option<u32> {
         }
         let n = (*table).NumEntries as usize;
         let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+        // В Windows итоговая метрика маршрута складывается из смещения маршрута
+        // (row.Metric) и метрики самого адаптера (iface.Metric).
+        let effective_metric = |if_index: u32, route_metric: u32| -> Option<u32> {
+            let mut iface: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+            iface.Family = AF_INET;
+            iface.InterfaceIndex = if_index;
+            if GetIpInterfaceEntry(&mut iface) == 0 {
+                if iface.Connected == 0 {
+                    return None;
+                }
+                Some(route_metric.saturating_add(iface.Metric))
+            } else {
+                Some(route_metric)
+            }
+        };
         let best = rows
             .iter()
-            .filter(|r| r.DestinationPrefix.PrefixLength == 0 && r.InterfaceIndex != tun_index && r.InterfaceIndex != 0)
-            .min_by_key(|r| r.Metric)
-            .map(|r| r.InterfaceIndex);
+            .filter(|r| {
+                r.DestinationPrefix.PrefixLength == 0
+                    && r.InterfaceIndex != tun_index
+                    && r.InterfaceIndex != 0
+            })
+            .filter_map(|r| effective_metric(r.InterfaceIndex, r.Metric).map(|m| (m, r.InterfaceIndex)))
+            .min_by_key(|(m, _)| *m)
+            .map(|(_, idx)| idx);
         FreeMibTable(table as *const core::ffi::c_void);
         best
     }

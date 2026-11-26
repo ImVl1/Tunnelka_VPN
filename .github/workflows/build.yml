@@ -3,7 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
-    paths-ignore: ["site/**", "README.md", ".github/workflows/main.yml"]
+    paths-ignore: ["site/**", "README.md", "README.ru.md", "AGENTS.md", ".github/workflows/main.yml"]
   pull_request:
   workflow_dispatch:
 
@@ -31,6 +31,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: npm install
       - run: npm run fetch-core
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo test -p tunnelka
       - run: npm run build
       - uses: actions/upload-artifact@v4
         with:
@@ -55,6 +58,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: npm install
       - run: npm run fetch-android
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Ключ подписи
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}

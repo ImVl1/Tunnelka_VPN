@@ -187,21 +187,53 @@ async fn read_clipboard() -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+#[cfg(windows)]
+fn shell_open(target: &std::ffi::OsStr, params: Option<&std::ffi::OsStr>) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut core::ffi::c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+    let to_wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
+    let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let file = to_wide(target);
+    let args = params.map(to_wide);
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            args.as_ref().map_or(std::ptr::null(), |a| a.as_ptr()),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    if rc <= 32 {
+        return Err(format!("не удалось открыть (код ShellExecute {rc})"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
-    if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("tg://")) {
+    let url = url.trim().to_string();
+    if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("tg://"))
+        || url.chars().any(|c| c.is_control())
+        || reqwest::Url::parse(&url).is_err()
+    {
         return Err("недопустимая ссылка".into());
     }
     // Ссылки открываются в браузере системы, а не внутри приложения.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", &url])
-            .creation_flags(0x0800_0000)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        shell_open(std::ffi::OsStr::new(&url), None)
     }
     #[cfg(not(windows))]
     {
@@ -229,18 +261,15 @@ fn update_progress(e: E<'_>) -> (u64, u64) {
 async fn install_update(app: tauri::AppHandle, e: E<'_>, url: String) -> Result<(), String> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let dir = std::env::temp_dir().join("tunnelka-update");
         let path = e.download_update(&url, &dir).await?;
         // Перед установкой — остановить ядра и снять kill switch, иначе
         // установщик не сможет заменить файлы, а интернет останется закрытым.
         e.unblock();
         // /P — установка с окном прогресса без вопросов, /R — запустить приложение после.
-        // start (ShellExecute) сам спросит права администратора, если нужно.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy(), "/P", "/R"])
-            .creation_flags(0x0800_0000)
-            .spawn()
+        // ShellExecuteW запускает установщик напрямую (без разбора спецсимволов в cmd.exe)
+        // и сам запрашивает права администратора, если нужно.
+        shell_open(path.as_os_str(), Some(std::ffi::OsStr::new("/P /R")))
             .map_err(|e| format!("не удалось запустить установщик: {e}"))?;
         let app2 = app.clone();
         tauri::async_runtime::spawn(async move {

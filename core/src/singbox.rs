@@ -89,9 +89,16 @@ pub fn uses_xray(s: &Server, settings: &Settings) -> bool {
 fn plain_dns_ip(addr: &str) -> String {
     let a = addr.trim();
     let a = a.split("://").nth(1).unwrap_or(a);
-    let host = a.split(['/', ':']).next().unwrap_or("");
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        host.to_string()
+    let hostport = a.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = hostport.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else if hostport.parse::<std::net::IpAddr>().is_ok() {
+        hostport
+    } else {
+        hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport)
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        ip.to_string()
     } else {
         "77.88.8.8".to_string()
     }
@@ -184,8 +191,9 @@ fn as_cidr(e: &str) -> Option<String> {
     Some(format!("{addr}/{bits}"))
 }
 
-/// Принимает `youtube.com`, `*.youtube.com`, `.youtube.com`, `*.ru` (все сайты
-/// в зоне .ru), адрес из браузера `https://www.youtube.com/watch?v=…`.
+/// Принимает `youtube.com`, `*.youtube.com`, `.youtube.com`, `*.ru`, `*.рф` (все сайты
+/// в зоне), адрес из браузера `https://www.youtube.com/watch?v=…`.
+/// Кириллические и другие IDN-домены переводятся в Punycode (DNS и SNI работают с ASCII).
 fn as_host(e: &str) -> Option<String> {
     let mut s = e.to_lowercase();
     let url = s.contains("://");
@@ -194,6 +202,9 @@ fn as_host(e: &str) -> Option<String> {
     }
     let s = s.split(['/', '?', '#']).next().unwrap_or("");
     let s = s.rsplit('@').next().unwrap_or(s);
+    if s.starts_with('[') {
+        return None;
+    }
     let s = s.split(':').next().unwrap_or(s);
     let s = s.trim_start_matches('*').trim_start_matches('.').trim_end_matches('.');
     // Из адреса сайта «www.» убираем: правило должно касаться всего сайта.
@@ -201,10 +212,22 @@ fn as_host(e: &str) -> Option<String> {
         Some(rest) if url && rest.contains('.') => rest,
         _ => s,
     };
-    let ok = !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_');
-    ok.then(|| s.to_string())
+    if s.is_empty() {
+        return None;
+    }
+    let ascii = if s.is_ascii() {
+        s.to_string()
+    } else {
+        reqwest::Url::parse(&format!("http://{s}"))
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))?
+    };
+    let ok = !ascii.is_empty()
+        && ascii.parse::<std::net::IpAddr>().is_err()
+        && ascii
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_');
+    ok.then_some(ascii)
 }
 
 /// `chrome.exe` → process_name, `C:\Games\x.exe` → process_path,
@@ -1005,12 +1028,27 @@ mod tests {
     fn site_entries() {
         let m = Matchers::from_entries(&[
             "*.ru".into(),
+            "*.рф".into(),
+            "https://www.мвд.рф/news?x=1".into(),
             "https://www.sberbank.ru/ru/person?x=1".into(),
             "http://Example.COM:8080/a".into(),
             "a.com, b.org  c.net".into(),
             "www.mail.ru".into(),
         ]);
-        assert_eq!(m.suffix, vec!["ru", "sberbank.ru", "example.com", "a.com", "b.org", "c.net", "www.mail.ru"]);
+        assert_eq!(
+            m.suffix,
+            vec![
+                "ru",
+                "xn--p1ai",
+                "xn--b1aew.xn--p1ai",
+                "sberbank.ru",
+                "example.com",
+                "a.com",
+                "b.org",
+                "c.net",
+                "www.mail.ru"
+            ]
+        );
     }
 
     #[test]
@@ -1120,5 +1158,9 @@ mod tests {
         assert_eq!(v["server_port"], 5353);
         assert_eq!(v["detour"], "proxy");
         assert!(!b);
+        assert_eq!(plain_dns_ip("2606:4700:4700::1111"), "2606:4700:4700::1111");
+        assert_eq!(plain_dns_ip("https://[2606:4700:4700::1111]:443/dns-query"), "2606:4700:4700::1111");
+        assert_eq!(plain_dns_ip("8.8.8.8:53"), "8.8.8.8");
+        assert_eq!(plain_dns_ip("https://dns.yandex.ru/dns-query"), "77.88.8.8");
     }
 }

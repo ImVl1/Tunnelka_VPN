@@ -23,13 +23,14 @@ class TunnelkaTileService : TileService() {
     override fun onClick() {
         super.onClick()
         when (TunnelkaVpnService.state) {
-            TunnelkaVpnService.State.STOPPED -> turnOn()
+            TunnelkaVpnService.State.STOPPED -> turnOn(TunnelkaVpnService.ACTION_START)
+            TunnelkaVpnService.State.PAUSED -> turnOn(TunnelkaVpnService.ACTION_RESUME)
             else -> startService(TunnelkaVpnService.intent(this, TunnelkaVpnService.ACTION_STOP))
         }
         render()
     }
 
-    private fun turnOn() {
+    private fun turnOn(action: String) {
         // Без разрешения на VPN или без сохранённого подключения нужен интерфейс.
         if (VpnService.prepare(this) != null || TunnelkaVpnService.profilePath(this) == null) {
             openApp()
@@ -38,7 +39,7 @@ class TunnelkaTileService : TileService() {
         try {
             TunnelkaVpnService.markStarting()
             ContextCompat.startForegroundService(
-                this, TunnelkaVpnService.intent(this, TunnelkaVpnService.ACTION_START)
+                this, TunnelkaVpnService.intent(this, action)
             )
         } catch (_: Exception) {
             openApp()
@@ -62,7 +63,11 @@ class TunnelkaTileService : TileService() {
     private fun render() {
         val tile = qsTile ?: return
         val st = TunnelkaVpnService.state
-        tile.state = if (st == TunnelkaVpnService.State.STOPPED) Tile.STATE_INACTIVE else Tile.STATE_ACTIVE
+        tile.state = if (st == TunnelkaVpnService.State.STOPPED || st == TunnelkaVpnService.State.PAUSED) {
+            Tile.STATE_INACTIVE
+        } else {
+            Tile.STATE_ACTIVE
+        }
         tile.label = "Tunnelka"
         if (Build.VERSION.SDK_INT >= 29) {
             tile.subtitle = when (st) {

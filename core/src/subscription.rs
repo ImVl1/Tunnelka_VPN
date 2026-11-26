@@ -189,12 +189,30 @@ fn servers_from_singbox_json(v: &Value, seed: &str) -> Vec<Server> {
             }
         }
         let address = ob["server"].as_str().unwrap_or("").to_string();
-        let transport = ob
-            .get("transport")
-            .and_then(|t| t.get("type"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("tcp")
-            .to_string();
+        let net = match ob.get("transport").and_then(|t| t.get("type")).and_then(|t| t.as_str()) {
+            Some(t) => t,
+            None if matches!(kind, "hysteria2" | "tuic") => "udp",
+            None => "tcp",
+        };
+        let sec = match ob.get("tls") {
+            Some(t)
+                if t.get("reality")
+                    .and_then(|r| r.get("enabled"))
+                    .and_then(|e| e.as_bool())
+                    == Some(true)
+                    || (t.get("reality").is_some() && t["reality"].get("enabled").is_none()) =>
+            {
+                "reality"
+            }
+            Some(t)
+                if t.get("enabled").and_then(|e| e.as_bool()) != Some(false)
+                    && !matches!(kind, "hysteria2" | "tuic") =>
+            {
+                "tls"
+            }
+            _ => "",
+        };
+        let transport = crate::links::transport_label(net, sec);
         let port = ob["server_port"].as_u64().unwrap_or(0) as u16;
         out.push(Server {
             id: server_id(&format!("{seed}|json|{}", outbound)),
@@ -385,10 +403,12 @@ mod tests {
 
     #[test]
     fn singbox_json() {
-        let body = r#"{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["a"]},{"type":"vless","tag":"🇩🇪 DE","server":"de.example.com","server_port":443,"uuid":"u","detour":"x"},{"type":"direct","tag":"direct"}]}"#;
+        let body = r#"{"outbounds":[{"type":"selector","tag":"proxy","outbounds":["a"]},{"type":"vless","tag":"🇩🇪 DE","server":"de.example.com","server_port":443,"uuid":"u","tls":{"enabled":true,"reality":{"enabled":true}},"detour":"x"},{"type":"hysteria2","tag":"🇫🇮 FI","server":"fi.example.com","server_port":443,"password":"p","tls":{"enabled":true}},{"type":"direct","tag":"direct"}]}"#;
         let f = parse_body(body, "x");
-        assert_eq!(f.servers.len(), 1);
+        assert_eq!(f.servers.len(), 2);
         assert_eq!(f.servers[0].name, "🇩🇪 DE");
+        assert_eq!(f.servers[0].transport, "tcp · reality");
+        assert_eq!(f.servers[1].transport, "udp");
         let ob = f.servers[0].outbound.as_ref().unwrap();
         assert!(ob.get("tag").is_none() && ob.get("detour").is_none());
     }

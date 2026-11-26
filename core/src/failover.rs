@@ -98,5 +98,9 @@ mod tests {
         assert!(t.is_empty());
         assert_eq!(nl_x.country().as_deref(), Some("NL"));
         assert_eq!(nl_x.kind(), "vless xhttp");
+        // Упоминание 🇷🇺 после зарубежного флага не делает сервер российским.
+        let de_for_ru = srv("de_ru", "🇩🇪 Германия (для 🇷🇺)", "tcp · reality");
+        assert_eq!(de_for_ru.country().as_deref(), Some("DE"));
+        assert!(!de_for_ru.is_domestic());
     }
 }

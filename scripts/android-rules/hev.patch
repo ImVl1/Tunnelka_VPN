@@ -4,7 +4,7 @@
  #include <string.h>
  
  #include "hev-main.h"
-+extern int app_rule_fd;
++void app_rule_set_fd (int fd);
  
  #include "hev-jni.h"
  
@@ -37,7 +37,7 @@
      if (!tdata)
          goto exit;
      tdata->fd = fd;
-+    app_rule_fd = rules;
++    app_rule_set_fd (rules);
  
      bytes = (const jbyte *)(*env)->GetStringUTFChars (env, config_path, NULL);
      if (!bytes) {

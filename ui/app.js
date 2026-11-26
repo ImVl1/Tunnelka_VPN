@@ -184,20 +184,27 @@ $$("button[data-mode]").forEach(b => b.onclick = () => {
   renderHome();
 });
 
+let polling = false;
 async function poll() {
+  if (polling) return;
+  polling = true;
   try {
     status = await invoke("status");
-    if (status.running) {
+    if (status.running && !status.paused) {
       $("#uptime").textContent = duration(Math.max(0, Math.floor(Date.now() / 1000) - status.started_at));
       const tr = await invoke("traffic");
       if (tr) {
         const t = performance.now();
         if (lastTraffic) {
           const dt = (t - lastTraffic.t) / 1000;
-          $("#down").textContent = `${bytes(Math.max(0, tr.down - lastTraffic.down) / dt)}/с`;
-          $("#up").textContent = `${bytes(Math.max(0, tr.up - lastTraffic.up) / dt)}/с`;
+          if (dt >= 0.2) {
+            $("#down").textContent = `${bytes(Math.max(0, tr.down - lastTraffic.down) / dt)}/с`;
+            $("#up").textContent = `${bytes(Math.max(0, tr.up - lastTraffic.up) / dt)}/с`;
+          }
         }
         lastTraffic = { ...tr, t };
+      } else {
+        lastTraffic = null;
       }
     } else {
       lastTraffic = null;
@@ -206,6 +213,7 @@ async function poll() {
     if (view === "settings" && isAndroid() && ++batteryTick % 5 === 0) renderBattery();
     if (view === "logs") loadLogs();
   } catch { /* окно в фоне */ }
+  finally { polling = false; }
 }
 
 function renderSideOnly() {
@@ -259,10 +267,9 @@ function renderServers() {
   for (const id of ["#auto-all", "#sub-tabs", "#sub-card"]) $(id).hidden = !!query;
   // «Автовыбор+» — поверх всех подписок.
   $("#auto-all").innerHTML = usableCount() > 1 ? `
-      <div class="srv plus ${data.selected === "auto+" ? "sel" : ""}" data-id="auto+">
+      <div class="srv plus ${data.selected === "auto+" ? "sel" : ""}" data-id="auto+" role="button" tabindex="0">
         <span class="dot"></span>
-        <span class="name"><b>Автовыбор+</b><small>лучший сервер из всех подписок</small></span>
-        <span class="proto"></span><span class="ping"></span><span></span>
+        <span class="srv-body"><span class="name"><b>Автовыбор+</b><small>лучший сервер из всех подписок</small></span></span>
       </div>` : "";
   $("#sub-tabs").innerHTML = subs
     .map((s) => `<button data-sub="${esc(s.id)}" class="${s.id === activeSub ? "active" : ""}">${esc(s.name)} <span class="muted">${s.servers.length}</span></button>`)
@@ -315,10 +322,9 @@ function renderServers() {
   const rows = [];
   if (!query && usable.length > 1) {
     rows.push(`
-      <div class="srv ${data.selected === autoId ? "sel" : ""}" data-id="${esc(autoId)}">
+      <div class="srv ${data.selected === autoId ? "sel" : ""}" data-id="${esc(autoId)}" role="button" tabindex="0">
         <span class="dot"></span>
-        <span class="name">Автовыбор<small>лучший сервер этой подписки</small></span>
-        <span class="proto"></span><span class="ping"></span><span></span>
+        <span class="srv-body"><span class="name">Автовыбор<small>лучший сервер этой подписки</small></span></span>
       </div>`);
   }
   for (const group of query ? subs : [sub]) {
@@ -327,21 +333,31 @@ function renderServers() {
     for (const s of matches) {
       const ok = !!(s.outbound || s.xray);
       rows.push(`
-        <div class="srv ${ok ? "" : "disabled"} ${data.selected === s.id ? "sel" : ""}" data-id="${esc(s.id)}" ${ok ? "" : `title="${esc(s.error)}"`}>
+        <div class="srv ${ok ? "" : "disabled"} ${data.selected === s.id ? "sel" : ""}" data-id="${esc(s.id)}" ${ok ? 'role="button" tabindex="0"' : `title="${esc(s.error)}"`}>
           <span class="dot"></span>
-          <span class="name">${esc(s.name)}${ok ? "" : `<small>${esc(s.error)}</small>`}</span>
-          <span class="proto">${esc(s.protocol)}${s.transport ? ` · ${esc(s.transport)}` : ""}${s.xray && !s.outbound ? ` <b class="xr" title="Работает через ядро Xray">Xray</b>` : ""}</span>
-          ${ok ? pingCell(s) : `<span class="ping"></span>`}
-          ${group.id === "manual" ? `<button class="icon" data-del="${esc(s.id)}" title="Удалить сервер">✕</button>` : "<span></span>"}
+          <span class="srv-body">
+            <span class="name">${esc(s.name)}${ok ? "" : `<small>${esc(s.error)}</small>`}</span>
+            <span class="proto">${esc(s.protocol)}${s.transport ? ` · ${esc(s.transport)}` : ""}${s.xray && !s.outbound ? ` <b class="xr" title="Работает через ядро Xray">Xray</b>` : ""}</span>
+          </span>
+          ${ok ? pingCell(s) : ""}
+          ${group.id === "manual" ? `<button type="button" class="icon" data-del="${esc(s.id)}" title="Удалить сервер" aria-label="Удалить сервер">✕</button>` : ""}
         </div>`);
     }
   }
   $("#server-list").innerHTML = rows.join("") || `<div class="empty">${query ? "Серверы не найдены" : "В подписке нет серверов"}</div>`;
-  $$("#server-list .srv:not(.disabled), #auto-all .srv").forEach((r) => (r.onclick = async (e) => {
-    if (e.target.closest("[data-del]")) return;
-    status = await call("select_server", { id: r.dataset.id });
-    await reload();
-  }));
+  $$("#server-list .srv:not(.disabled), #auto-all .srv").forEach((r) => {
+    r.onclick = async (e) => {
+      if (e.target.closest("[data-del]")) return;
+      status = await call("select_server", { id: r.dataset.id });
+      await reload();
+    };
+    r.onkeydown = (e) => {
+      if ((e.key === "Enter" || e.key === " ") && !e.target.closest("[data-del]")) {
+        e.preventDefault();
+        r.click();
+      }
+    };
+  });
   $$("[data-del]").forEach((b) => (b.onclick = async () => { await call("remove_server", { id: b.dataset.del }); await reload(); }));
 }
 
@@ -421,28 +437,26 @@ let renameQueue = Promise.resolve();
 function renameSubscription(sub) {
   const dialog = $("#rename-dialog");
   const input = $("#rename-input");
-  let timer;
-  let saved = sub.name;
+  const saved = sub.name;
   input.value = saved;
-  function commit() {
-    clearTimeout(timer);
-    const name = input.value.trim();
-    if (!name) return;
-    renameQueue = renameQueue.then(async () => {
-      if (name === saved) return;
-      await call("rename_subscription", { id: sub.id, name });
-      saved = name;
-      await reload();
-    }).catch(() => {}); // call() displays the error; subsequent edits can retry.
-  }
   input.oninput = () => {
     input.setCustomValidity(input.value.trim() ? "" : "Введите название подписки");
-    clearTimeout(timer);
-    timer = setTimeout(commit, 800);
   };
   input.setCustomValidity("");
-  dialog.onclose = commit;
-  input.onblur = commit;
+  $("#rename-cancel").onclick = () => {
+    dialog.returnValue = "cancel";
+    dialog.close();
+  };
+  dialog.onclose = () => {
+    if (dialog.returnValue !== "ok") return;
+    const name = input.value.trim();
+    if (!name || name === saved) return;
+    renameQueue = renameQueue.then(async () => {
+      await call("rename_subscription", { id: sub.id, name });
+      await reload();
+    }).catch(() => {}); // call() displays the error; subsequent edits can retry.
+  };
+  dialog.returnValue = "";
   dialog.showModal();
   input.select();
 }
@@ -485,6 +499,7 @@ $("#add-btn").onclick = async () => {
   const input = $("#add-input").value.trim();
   if (!input) return toast("Вставьте ссылку", true);
   const btn = $("#add-btn");
+  const prevHtml = btn.innerHTML;
   btn.disabled = true;
   btn.textContent = "Загружаю…";
   try {
@@ -492,7 +507,7 @@ $("#add-btn").onclick = async () => {
     $("#add-input").value = "";
   } finally {
     btn.disabled = false;
-    btn.textContent = "Добавить";
+    btn.innerHTML = prevHtml;
     await reload();
   }
 };
@@ -613,9 +628,14 @@ function renderAppRoutes() {
   const select = $("#route-target");
   if (!servers.has(select.value)) select.value = "";
   select.querySelector("span").textContent = servers.get(select.value) ?? "Без интернета";
-  $("#app-routes").innerHTML = splitDraft.app_routes.map((r, i) =>
-    `<div class="row"><span>${esc(appLabels[r.app] ?? r.app)} → ${esc(r.server ? servers.get(r.server) ?? "Сервер недоступен · без интернета" : "Без интернета")}</span>
-    <button class="btn" data-i="${i}" aria-label="Удалить правило">Удалить</button></div>`).join("");
+  $("#app-routes").innerHTML = splitDraft.app_routes.map((r, i) => {
+    const dest = r.server ? servers.get(r.server) ?? "Сервер недоступен · без интернета" : "Без интернета";
+    const blocked = !r.server || !servers.has(r.server);
+    return `<div class="route-item">
+      <div class="route-text"><b title="${esc(r.app)}">${esc(appLabels[r.app] ?? r.app)}</b><small class="${blocked ? "blocked" : ""}">${esc(dest)}</small></div>
+      <button type="button" class="icon" data-i="${i}" title="Удалить правило" aria-label="Удалить правило">✕</button>
+    </div>`;
+  }).join("");
   $$("#app-routes button").forEach(b => b.onclick = () => {
     splitDraft.app_routes.splice(+b.dataset.i, 1);
     splitChanged();
@@ -644,6 +664,16 @@ $$(".picker-back").forEach(button => {
   button.onclick = () => closePicker(dialog);
   dialog.addEventListener("close", () => { if (!dialog.open) releasePicker(dialog); });
 });
+// Закрытие диалоговых окон при клике по затемнённому фону снаружи.
+$$("dialog").forEach(dialog => dialog.addEventListener("mousedown", e => {
+  if (e.target !== dialog) return;
+  if (dialog.id === "update-dialog" && $("#update-go").disabled) return;
+  const r = dialog.getBoundingClientRect();
+  if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+    if (dialog.id === "rename-dialog") dialog.returnValue = "cancel";
+    closePicker(dialog);
+  }
+}));
 
 function renderTargetList() {
   const query = $("#target-search").value.trim();
@@ -689,6 +719,7 @@ $("#route-add").onclick = () => {
   $("#route-app").value = "";
   splitChanged();
 };
+$("#route-app").onkeydown = (e) => { if (e.key === "Enter") $("#route-add").click(); };
 let appRequest = 0;
 let pickingRoutes = false;
 let procs = [];
@@ -698,7 +729,7 @@ function renderProcs() {
   const chosen = new Set(selected.map((a) => a.toLowerCase()));
   $("#proc-list").innerHTML = procs
     .filter((p) => !f || p.label.toLowerCase().includes(f) || (p.detail ?? "").toLowerCase().includes(f))
-    .map((p) => `<label><input type="checkbox" value="${esc(p.id)}" ${chosen.has(p.id.toLowerCase()) ? "checked" : ""} />${esc(p.label)}<small>${esc(p.detail ?? "")}</small></label>`)
+    .map((p) => `<label title="${esc(p.detail ?? p.label)}"><input type="checkbox" value="${esc(p.id)}" ${chosen.has(p.id.toLowerCase()) ? "checked" : ""} /><span class="proc-name">${esc(p.label)}</span><small>${esc(p.detail ?? "")}</small></label>`)
     .join("") || `<div class="empty">Ничего не найдено</div>`;
   $$("#proc-list input").forEach((i) => (i.onchange = () => {
     if (pickingRoutes) {
@@ -761,11 +792,17 @@ let saveError = "";
 const savedSections = new Set();
 let settingsVersion = 0;
 
+function splitAppsMissing(split) {
+  if (!split || split.app_mode === "off") return false;
+  const list = split.app_mode === "include" ? split.apps_include : split.apps_exclude;
+  return !list.length;
+}
+
+function effectiveSplit(split) {
+  return splitAppsMissing(split) ? { ...split, app_mode: "off" } : split;
+}
+
 function validationError(key, value) {
-  if (key === "split" && value.app_mode !== "off") {
-    const list = value.app_mode === "include" ? value.apps_include : value.apps_exclude;
-    if (!list.length) return "Выберите хотя бы одно приложение";
-  }
   if (key === "mixed_port" || key === "lan_port") {
     if (key === "mixed_port" && value === 0) return "";
     if (!Number.isInteger(value) || value < 1024 || value > 65535)
@@ -802,8 +839,9 @@ function resumeChanges() {
 function updateSaveStatus() {
   for (const [id, rules] of [["#settings-status", false], ["#split-status", true]]) {
     const edits = Object.entries(settingsEdits).filter(([key]) => (key === "split") === rules);
-    const error = edits.map(([key, value]) => validationError(key, value)).find(Boolean);
-    $(id).textContent = error || (edits.length ? saveError || "Сохранение…" : savedSections.has(rules) ? "Сохранено" : "");
+    const error = edits.map(([key, value]) => validationError(key, value)).find(Boolean)
+      || (rules && splitAppsMissing(splitDraft) ? "Выберите хотя бы одно приложение" : "");
+    $(id).textContent = edits.length ? (saveError || "Сохранение…") : (error || (savedSections.has(rules) ? "Сохранено" : ""));
   }
 }
 
@@ -823,6 +861,7 @@ async function flushSettings() {
   const changes = pendingChanges();
   if (!Object.keys(changes).length) return;
   const next = { ...data.settings, ...changes };
+  if ("split" in changes) next.split = effectiveSplit(changes.split);
   for (const [key, value] of Object.entries(changes)) {
     if (typeof value === "string") next[key] = value.trim();
   }

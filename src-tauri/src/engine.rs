@@ -107,6 +107,8 @@ struct Rt {
     ping_partial: HashMap<String, i64>,
     /// Скачивание обновления: (получено, всего) байт.
     update_progress: (u64, u64),
+    /// Проверенный адрес файла обновления из последней проверки релизов.
+    update_url: Option<String>,
     /// Android: время последнего переключения сервера VPN-сервисом, мс.
     monitor_at: u64,
 }
@@ -441,20 +443,63 @@ impl Engine {
             Ok(tc) => tc,
             Err(e) => return Err(format!("{first}; через VPN: {e}")),
         };
-        let proxy = tc.proxy.clone().unwrap_or_default();
-        // Автовыбор проверяет серверы в фоне: если первый не сработал, ждём его.
-        let mut res = Err(String::new());
-        for attempt in 0..3 {
-            res = subscription::fetch(url, &ua, seed, Some(&proxy)).await;
-            if res.is_ok() {
-                break;
-            }
-            if attempt < 2 {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        }
+        let res = self.fetch_via_temp(&tc, &servers, url, &ua, seed).await;
         drop(tc);
         res.map_err(|e| format!("{first}; через VPN: {e}"))
+    }
+
+    /// Перебирает живые серверы во временном ядре и скачивает подписку через первый рабочий.
+    async fn fetch_via_temp(
+        &self,
+        tc: &TempCore,
+        servers: &[Server],
+        url: &str,
+        ua: &str,
+        seed: &str,
+    ) -> Result<Fetched, String> {
+        use futures::stream::{self, StreamExt};
+        let proxy = tc.proxy.clone().unwrap_or_default();
+        let candidates: Vec<(String, String)> = servers
+            .iter()
+            .filter(|s| !s.is_domestic())
+            .chain(servers.iter().filter(|s| s.is_domestic()))
+            .flat_map(|s| {
+                let id = s.id.clone();
+                let parts = tc.groups.get(&id).cloned().unwrap_or_else(|| vec![id.clone()]);
+                parts.into_iter().map(move |part| (id.clone(), part))
+            })
+            .collect();
+        let mut probes = stream::iter(candidates)
+            .map(|(id, part)| async move {
+                let ms = proxy_delay(&self.http, &tc.base, &tc.secret, &part, 3500).await?;
+                Some((id, part, ms))
+            })
+            .buffer_unordered(16);
+        let mut tried = 0usize;
+        let mut last_err = None;
+        while let Some(item) = probes.next().await {
+            let Some((id, part, _)) = item else { continue };
+            if part != id && clash_put_at(&self.http, &tc.base, &tc.secret, &id, &part).await.is_err() {
+                continue;
+            }
+            if clash_put_at(&self.http, &tc.base, &tc.secret, TAG_PROXY, &id).await.is_err() {
+                continue;
+            }
+            match subscription::fetch(url, ua, seed, Some(&proxy)).await {
+                Ok(f) => return Ok(f),
+                Err(e) => last_err = Some(e),
+            }
+            tried += 1;
+            if tried >= 3 {
+                break;
+            }
+        }
+        drop(probes);
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        // На случай «белых списков», где gstatic.com не отвечает, а панель доступна.
+        subscription::fetch(url, ua, seed, Some(&proxy)).await
     }
 
     /// Локальный прокси работающего подключения (если он есть).
@@ -490,7 +535,7 @@ impl Engine {
     }
 
     /// Добавляет подписку по ссылке или, если это не http(s), — серверы из текста.
-    pub async fn add_subscription(&self, input: &str) -> Result<String, String> {
+    pub async fn add_subscription(self: &Arc<Self>, input: &str) -> Result<String, String> {
         let input = input.trim();
         if input.is_empty() {
             return Err("вставьте ссылку на подписку или ссылки на серверы".into());
@@ -530,7 +575,7 @@ impl Engine {
             last_error: None,
             servers: f.servers,
         };
-        {
+        let auto_all = {
             let mut st = self.state.lock().unwrap();
             st.subscriptions.retain(|s| s.id != id);
             // Ручная группа всегда в конце.
@@ -541,11 +586,15 @@ impl Engine {
                 .unwrap_or(st.subscriptions.len());
             st.subscriptions.insert(pos, sub);
             if st.selected.is_none() {
-                st.selected = Some(format!("{}{id}", Selection::AUTO_PREFIX));
+                repair_selection(&mut st);
             }
-        }
+            st.selected.as_deref() == Some(Selection::AUTO_ALL)
+        };
         self.save();
         self.log(format!("[app] подписка добавлена ({id})"));
+        if auto_all {
+            let _ = self.restart_if_running().await;
+        }
         Ok(id)
     }
 
@@ -585,20 +634,14 @@ impl Engine {
             }
             added = sub.servers.len() - before;
             if st.selected.is_none() {
-                let first = st
-                    .subscriptions
-                    .iter()
-                    .find(|s| s.id == MANUAL_SUB)
-                    .and_then(|s| s.servers.iter().find(|x| x.usable()))
-                    .map(|x| x.id.clone());
-                st.selected = first;
+                repair_selection(&mut st);
             }
         }
         self.save();
         Ok(added)
     }
 
-    pub async fn update_subscription(&self, id: &str) -> Result<(), String> {
+    async fn update_subscription_inner(&self, id: &str) -> Result<bool, String> {
         let url = {
             let st = self.state.lock().unwrap();
             let sub = st
@@ -609,11 +652,27 @@ impl Engine {
             sub.url.clone().ok_or("эту группу нельзя обновить")?
         };
         let res = self.fetch(&url, id, Some(id)).await;
+        let mut changed = false;
         {
             let mut st = self.state.lock().unwrap();
+            let prev_selected = st.selected.clone();
+            let mut next_selected: Option<Option<String>> = None;
+            let prev_server_name = st
+                .selected
+                .as_deref()
+                .and_then(|sel| {
+                    st.subscriptions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .and_then(|s| s.servers.iter().find(|x| x.id == sel))
+                        .map(|x| x.name.clone())
+                });
             if let Some(sub) = st.subscriptions.iter_mut().find(|s| s.id == id) {
                 match &res {
                     Ok(f) => {
+                        if sub.servers != f.servers {
+                            changed = true;
+                        }
                         if let Some(t) = &f.title {
                             sub.name = t.clone();
                         }
@@ -627,38 +686,85 @@ impl Engine {
                         sub.web_page_url = f.web_page_url.clone().or(sub.web_page_url.take());
                         sub.announce = f.announce.clone();
                         sub.last_error = None;
+                        if let Some(old_name) = prev_server_name {
+                            let still_there = prev_selected
+                                .as_deref()
+                                .map(|sel| sub.servers.iter().any(|x| x.id == sel && x.usable()))
+                                .unwrap_or(false);
+                            if !still_there {
+                                next_selected = Some(
+                                    sub.servers
+                                        .iter()
+                                        .find(|x| x.usable() && x.name == old_name)
+                                        .map(|x| x.id.clone())
+                                        .or_else(|| default_for_sub(sub)),
+                                );
+                            }
+                        }
                     }
                     Err(e) => sub.last_error = Some(e.clone()),
                 }
             }
+            if let Some(sel) = next_selected {
+                st.selected = sel;
+            }
+            repair_selection(&mut st);
+            if st.selected != prev_selected {
+                changed = true;
+            }
         }
         self.save();
-        res.map(|_| ())
+        res.map(|_| changed)
+    }
+
+    async fn sync_after_sub_change(self: &Arc<Self>) {
+        if !self.is_running() || self.rt.lock().unwrap().paused {
+            return;
+        }
+        if self.state.lock().unwrap().selected.is_none() {
+            self.disconnect();
+        } else {
+            let _ = self.restart_if_running().await;
+        }
+    }
+
+    pub async fn update_subscription(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        let changed = self.update_subscription_inner(id).await?;
+        if changed {
+            self.sync_after_sub_change().await;
+        }
+        Ok(())
     }
 
     /// Автообновление подписок: при запуске приложения и затем раз в час
-    /// проверяет, но каждую подписку обновляет не чаще раза в сутки.
-    pub async fn update_due(&self) {
-        const DAY: u64 = 24 * 3600;
+    /// проверяет интервал `update_interval_h` каждой подписки.
+    pub async fn update_due(self: &Arc<Self>) {
         let due: Vec<String> = {
             let st = self.state.lock().unwrap();
             let t = now();
             st.subscriptions
                 .iter()
-                .filter(|s| s.url.is_some())
-                .filter(|s| t.saturating_sub(s.updated_at) >= DAY)
+                .filter(|s| s.url.is_some() && s.update_interval_h > 0)
+                .filter(|s| t.saturating_sub(s.updated_at) >= (s.update_interval_h as u64) * 3600)
                 .map(|s| s.id.clone())
                 .collect()
         };
+        let mut any_changed = false;
         for id in due {
-            match self.update_subscription(&id).await {
-                Ok(()) => self.log(format!("[app] подписка {id} обновлена автоматически")),
+            match self.update_subscription_inner(&id).await {
+                Ok(changed) => {
+                    any_changed |= changed;
+                    self.log(format!("[app] подписка {id} обновлена автоматически"));
+                }
                 Err(e) => self.log(format!("[app] автообновление подписки {id}: {e}")),
             }
         }
+        if any_changed {
+            self.sync_after_sub_change().await;
+        }
     }
 
-    pub async fn update_all(&self) -> Vec<String> {
+    pub async fn update_all(self: &Arc<Self>) -> Vec<String> {
         let ids: Vec<String> = {
             let st = self.state.lock().unwrap();
             st.subscriptions
@@ -668,10 +774,15 @@ impl Engine {
                 .collect()
         };
         let mut errors = vec![];
+        let mut any_changed = false;
         for id in ids {
-            if let Err(e) = self.update_subscription(&id).await {
-                errors.push(e);
+            match self.update_subscription_inner(&id).await {
+                Ok(changed) => any_changed |= changed,
+                Err(e) => errors.push(e),
             }
+        }
+        if any_changed {
+            self.sync_after_sub_change().await;
         }
         errors
     }
@@ -687,20 +798,14 @@ impl Engine {
         if was_active {
             self.disconnect();
         }
-        {
+        let empty_after = {
             let mut st = self.state.lock().unwrap();
             st.subscriptions.retain(|s| s.id != id);
-            let still_valid = st
-                .selected
-                .as_ref()
-                .map(|sel| find_selection(&st.subscriptions, sel).is_some())
-                .unwrap_or(false);
-            if !still_valid {
-                st.selected = st
-                    .subscriptions
-                    .first()
-                    .map(|s| format!("{}{}", Selection::AUTO_PREFIX, s.id));
-            }
+            repair_selection(&mut st);
+            st.selected.is_none()
+        };
+        if empty_after && self.is_running() {
+            self.disconnect();
         }
         self.save();
     }
@@ -716,6 +821,11 @@ impl Engine {
     }
 
     pub fn remove_server(&self, id: &str) {
+        let was_active = self.is_running()
+            && self.state.lock().unwrap().selected.as_deref() == Some(id);
+        if was_active {
+            self.disconnect();
+        }
         {
             let mut st = self.state.lock().unwrap();
             for sub in st.subscriptions.iter_mut().filter(|s| s.id == MANUAL_SUB) {
@@ -724,6 +834,7 @@ impl Engine {
             if st.selected.as_deref() == Some(id) {
                 st.selected = None;
             }
+            repair_selection(&mut st);
         }
         self.save();
     }
@@ -1259,15 +1370,13 @@ impl Engine {
             (format!("http://127.0.0.1:{}", rt.run.clash_port), rt.run.secret.clone())
         };
 
-        // Ждём, пока ядро поднимется (обычно доли секунды), вместо фиксированной паузы.
-        let ready = self.wait_ready(&clash.0, &clash.1).await;
-        // Ядра уже прочитали конфиги — файлы с паролями серверов больше не нужны.
-        let (c1, c2) = (self.paths.config.clone(), self.paths.xray_config.clone());
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let _ = std::fs::remove_file(c1);
-            let _ = std::fs::remove_file(c2);
-        });
+        let xray_port = config.xray.as_ref().and_then(|_| run.xray_ports.first().copied());
+        // Ждём, пока оба ядра поднимутся (обычно доли секунды), вместо фиксированной паузы.
+        let ready = self.wait_ready(&clash.0, &clash.1, xray_port).await;
+        // Ядра уже прочитали конфиги — удаляем файлы с паролями сразу, без фонового таймера,
+        // который при быстром переподключении мог бы стереть конфиг следующего запуска.
+        let _ = std::fs::remove_file(&self.paths.config);
+        let _ = std::fs::remove_file(&self.paths.xray_config);
         if !ready {
             let err = self
                 .rt
@@ -1290,15 +1399,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Ждёт ответа Clash API ядра. false — ядро завершилось или не ответило.
-    async fn wait_ready(&self, base: &str, secret: &str) -> bool {
+    /// Ждёт ответа Clash API sing-box и (если запущен Xray) его локального порта.
+    async fn wait_ready(&self, base: &str, secret: &str, xray_port: Option<u16>) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if !self.is_running() {
                 return false;
             }
-            let ok = self
+            let sb_ok = self
                 .http
                 .get(format!("{base}/version"))
                 .bearer_auth(secret)
@@ -1307,7 +1416,20 @@ impl Engine {
                 .await
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
-            if ok {
+            if !sb_ok {
+                continue;
+            }
+            let xr_ok = match xray_port {
+                Some(port) => tokio::time::timeout(
+                    Duration::from_millis(300),
+                    tokio::net::TcpStream::connect(("127.0.0.1", port)),
+                )
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false),
+                None => true,
+            };
+            if xr_ok {
                 return true;
             }
         }
@@ -2202,19 +2324,7 @@ impl Engine {
     /// Выбор внутри группы-селектора sing-box.
     async fn clash_put(&self, group: &str, tag: &str) -> Result<(), String> {
         let (base, secret) = self.clash_base();
-        let r = self
-            .http
-            .put(format!("{base}/proxies/{}", enc(group)))
-            .bearer_auth(secret)
-            .json(&serde_json::json!({ "name": tag }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if r.status().is_success() {
-            Ok(())
-        } else {
-            Err(format!("HTTP {}", r.status()))
-        }
+        clash_put_at(&self.http, &base, &secret, group, tag).await
     }
 
     pub async fn traffic(&self) -> Option<Traffic> {
@@ -2316,12 +2426,18 @@ impl Engine {
             .flatten()
             .find(|a| want(a["name"].as_str().unwrap_or_default()));
         let notes: String = v["body"].as_str().unwrap_or_default().chars().take(1500).collect();
+        let asset_url = asset
+            .and_then(|a| a["browser_download_url"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        let available = newer(&latest, &current) && !asset_url.is_empty();
+        self.rt.lock().unwrap().update_url = available.then(|| asset_url.clone());
         Ok(UpdateInfo {
-            available: newer(&latest, &current) && asset.is_some(),
+            available,
             current,
             latest,
             notes,
-            url: asset.and_then(|a| a["browser_download_url"].as_str()).unwrap_or_default().to_string(),
+            url: asset_url,
             size: asset.and_then(|a| a["size"].as_u64()).unwrap_or(0),
             page: v["html_url"].as_str().unwrap_or_default().to_string(),
         })
@@ -2359,13 +2475,30 @@ impl Engine {
 
     /// Скачивает установщик новой версии в `dir`. Возвращает путь к файлу.
     pub async fn download_update(&self, url: &str, dir: &std::path::Path) -> Result<PathBuf, String> {
-        let allowed = url.starts_with(&format!("https://github.com/{REPO}/releases/download/"));
+        let parsed = reqwest::Url::parse(url).map_err(|_| "недопустимый адрес обновления")?;
+        let prefix = format!("/{REPO}/releases/download/");
+        let expected_ok = match self.rt.lock().unwrap().update_url.as_deref() {
+            Some(expected) => expected == url,
+            None => true,
+        };
+        let allowed = expected_ok
+            && parsed.scheme() == "https"
+            && parsed.host_str() == Some("github.com")
+            && parsed.path().starts_with(&prefix)
+            && !parsed.path().contains("..");
         if !allowed {
             return Err("недопустимый адрес обновления".into());
         }
-        let name = url.rsplit('/').next().unwrap_or("update").replace(['/', '\\', ':'], "_");
+        let raw_name = parsed.path().rsplit('/').next().unwrap_or("");
+        let clean: String = raw_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .collect();
+        let clean = clean.trim_start_matches('.');
+        let fallback = if PLATFORM == Platform::Android { "tunnelka-update.apk" } else { "tunnelka-update.exe" };
+        let name = if clean.is_empty() { fallback } else { clean };
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let path = dir.join(&name);
+        let path = dir.join(name);
         let build = |proxy: Option<String>| -> Result<reqwest::Client, String> {
             let mut b = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -2522,25 +2655,10 @@ impl Engine {
             })?;
             (built, run)
         };
-        let mut built = built;
-        if !with_proxy {
-            // Для проверки пинга автовыбор не нужен: группы без своих проверок,
-            // чтобы не удваивать число соединений.
-            if let Some(obs) = built.singbox["outbounds"].as_array_mut() {
-                for o in obs.iter_mut().filter(|o| o["type"] == "urltest") {
-                    let first = o["outbounds"][0].clone();
-                    let m = o.as_object_mut().unwrap();
-                    m.insert("type".into(), serde_json::json!("selector"));
-                    for k in ["url", "interval", "tolerance"] {
-                        m.remove(k);
-                    }
-                    m.insert("default".into(), first);
-                }
-            }
-        }
         let dir = self.paths.data.join("probe").join(&random_token()[..8]);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mut guard = Probe { children: vec![], dir: dir.clone() };
+        let xray_port = built.xray.as_ref().and_then(|_| run.xray_ports.first().copied());
         if let Some(x) = &built.xray {
             let p = dir.join("xray.json");
             write_private(&p, x)?;
@@ -2559,7 +2677,7 @@ impl Engine {
             if guard.children.iter_mut().any(|c| matches!(c.try_wait(), Ok(Some(_)))) {
                 return Err("ядро завершилось".into());
             }
-            let ok = self
+            let sb_ok = self
                 .http
                 .get(format!("{base}/version"))
                 .bearer_auth(&run.secret)
@@ -2568,7 +2686,17 @@ impl Engine {
                 .await
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
-            if ok {
+            let xr_ok = match xray_port {
+                Some(port) if sb_ok => tokio::time::timeout(
+                    Duration::from_millis(300),
+                    tokio::net::TcpStream::connect(("127.0.0.1", port)),
+                )
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false),
+                _ => sb_ok,
+            };
+            if xr_ok {
                 break;
             }
             if std::time::Instant::now() > deadline {
@@ -2609,10 +2737,89 @@ pub struct UpdateInfo {
     pub page: String,
 }
 
-/// `a` новее `b` (версии вида 1.3.5).
+/// `a` новее `b` (версии вида 1.3.5, релиз новее пре-релиза той же версии).
 fn newer(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> { v.split(['.', '-']).map(|x| x.parse().unwrap_or(0)).take(3).collect() };
+    let parse = |v: &str| -> ([u64; 3], bool, String) {
+        let v = v.trim().trim_start_matches('v');
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c, p),
+            None => (v, ""),
+        };
+        let mut nums = [0u64; 3];
+        for (dst, part) in nums.iter_mut().zip(core.split('.')) {
+            *dst = part.parse().unwrap_or(0);
+        }
+        (nums, pre.is_empty(), pre.to_string())
+    };
     parse(a) > parse(b)
+}
+
+/// Выбор по умолчанию внутри подписки: автовыбор, если рабочих серверов больше одного,
+/// иначе единственный рабочий сервер.
+fn default_for_sub(sub: &Subscription) -> Option<String> {
+    let mut usable = sub.servers.iter().filter(|s| s.usable());
+    let first = usable.next()?;
+    if usable.next().is_some() {
+        Some(format!("{}{}", Selection::AUTO_PREFIX, sub.id))
+    } else {
+        Some(first.id.clone())
+    }
+}
+
+/// Приводит `st.selected` в соответствие с оставшимися подписками и серверами.
+fn repair_selection(st: &mut Persisted) {
+    let usable_subs = st
+        .subscriptions
+        .iter()
+        .filter(|s| s.servers.iter().any(|x| x.usable()))
+        .count();
+    let valid = match st.selected.as_deref().map(Selection::parse) {
+        Some(Selection::AutoAll) => usable_subs > 1,
+        Some(Selection::Auto(sub_id)) => st
+            .subscriptions
+            .iter()
+            .find(|s| s.id == sub_id)
+            .map(|s| s.servers.iter().filter(|x| x.usable()).count() > 1)
+            .unwrap_or(false),
+        Some(Selection::Server(id)) => st
+            .subscriptions
+            .iter()
+            .any(|s| s.servers.iter().any(|x| x.id == id && x.usable())),
+        None => false,
+    };
+    if valid {
+        return;
+    }
+    if let Some(Selection::Auto(sub_id)) = st.selected.as_deref().map(Selection::parse) {
+        if let Some(sub) = st.subscriptions.iter().find(|s| s.id == sub_id) {
+            if let Some(pick) = default_for_sub(sub) {
+                st.selected = Some(pick);
+                return;
+            }
+        }
+    }
+    st.selected = st.subscriptions.iter().find_map(default_for_sub);
+}
+
+async fn clash_put_at(
+    http: &reqwest::Client,
+    base: &str,
+    secret: &str,
+    group: &str,
+    tag: &str,
+) -> Result<(), String> {
+    let r = http
+        .put(format!("{base}/proxies/{}", enc(group)))
+        .bearer_auth(secret)
+        .json(&serde_json::json!({ "name": tag }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if r.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", r.status()))
+    }
 }
 
 /// Что выбрано: автовыбор по всем подпискам, автовыбор подписки или сервер.
@@ -2814,5 +3021,49 @@ mod health_tests {
             assert_eq!(winner, Some(("group".into(), 25, Some("fast".into()))));
         });
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn version_comparison_handles_short_and_prerelease_tags() {
+        assert!(!newer("1.4.0", "1.4"));
+        assert!(!newer("1.4.2", "1.4.2"));
+        assert!(newer("1.4.3", "1.4.2"));
+        assert!(newer("1.5", "1.4.9"));
+        assert!(newer("1.5.0", "1.5.0-beta.1"));
+        assert!(!newer("1.5.0-beta.1", "1.5.0"));
+    }
+
+    #[test]
+    fn selection_repairs_when_auto_all_loses_second_subscription() {
+        let mk_sub = |id: &str, links: &[&str]| Subscription {
+            id: id.into(),
+            name: id.into(),
+            url: Some(format!("https://{id}.example.com")),
+            info: None,
+            updated_at: 0,
+            update_interval_h: 12,
+            support_url: None,
+            web_page_url: None,
+            announce: None,
+            last_error: None,
+            servers: links
+                .iter()
+                .filter_map(|l| tunnelka_core::links::link_to_server(l, id))
+                .collect(),
+        };
+        let l1 = "vless://u@a.example.com:443?security=tls#A";
+        let l2 = "vless://u@b.example.com:443?security=tls#B";
+        let mut st = Persisted {
+            subscriptions: vec![mk_sub("s1", &[l1]), mk_sub("s2", &[l2])],
+            selected: Some(Selection::AUTO_ALL.into()),
+            ..Default::default()
+        };
+        repair_selection(&mut st);
+        assert_eq!(st.selected.as_deref(), Some("auto+"));
+
+        // Осталась одна подписка с одним сервером — «auto+» и «auto:s1» скрыты, выбирается сам сервер.
+        st.subscriptions.pop();
+        repair_selection(&mut st);
+        assert_eq!(st.selected, Some(st.subscriptions[0].servers[0].id.clone()));
     }
 }

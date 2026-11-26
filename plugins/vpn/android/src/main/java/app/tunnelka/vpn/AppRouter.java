@@ -69,6 +69,17 @@ final class AppRouter {
         return new InetSocketAddress(InetAddress.getByAddress(address), port);
     }
 
+    /** Android's system DNS daemon (netd) sends queries to TUN_DNS (198.18.0.2:53) under its own UID. */
+    private static boolean isSystemDns(byte[] packet, int dstPort) {
+        return packet[0] == OsConstants.IPPROTO_UDP
+                && dstPort == 53
+                && packet[1] == 4
+                && (packet[22] & 255) == 198
+                && (packet[23] & 255) == 18
+                && packet[24] == 0
+                && packet[25] == 2;
+    }
+
     private void serve() {
         try (ParcelFileDescriptor peer = sockets[1]) {
             DataInputStream input = new DataInputStream(new FileInputStream(peer.getFileDescriptor()));
@@ -80,7 +91,10 @@ final class AppRouter {
                 int dstPort = ((packet[4] & 255) << 8) | (packet[5] & 255);
                 int owner = connectivity.getConnectionOwnerUid(packet[0],
                         endpoint(packet, 6, srcPort), endpoint(packet, 22, dstPort));
-                output.writeInt(owner < 0 ? -1 : routes.getOrDefault(owner, 0));
+                int route = owner >= 0
+                        ? routes.getOrDefault(owner, 0)
+                        : (isSystemDns(packet, dstPort) ? 0 : -1);
+                output.writeInt(route);
             }
         } catch (IOException | SecurityException ignored) {
             // Service shutdown or revoked VPN ownership. Closing the peer makes

@@ -76,6 +76,11 @@ class TunnelkaVpnService : VpnService() {
         @Volatile
         private var hevRunning = false
 
+        @Volatile
+        private var activeService: TunnelkaVpnService? = null
+
+        private val worker = Executors.newSingleThreadExecutor()
+
         /** Туннель поднят и библиотека туннеля работает. */
         fun alive(): Boolean = state == State.RUNNING && hevRunning && try {
             TProxyService.TProxyIsRunning()
@@ -108,7 +113,6 @@ class TunnelkaVpnService : VpnService() {
         private fun wanted(ctx: Context) = prefs(ctx).getBoolean(KEY_WANTED, false)
     }
 
-    private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private val procs = mutableListOf<Process>()
     private var tun: ParcelFileDescriptor? = null
@@ -122,6 +126,7 @@ class TunnelkaVpnService : VpnService() {
     private var latestStartId = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        activeService = this
         latestStartId = startId
         when (intent?.action) {
             ACTION_STOP -> worker.execute { stopAll(startId) }
@@ -232,8 +237,9 @@ class TunnelkaVpnService : VpnService() {
             procs.add(proc)
             pipeToLog(proc, log)
         }
-        // Ждём, пока sing-box откроет локальный порт.
+        // Ждём, пока sing-box (и Xray, если он запущен) откроют локальные порты.
         val port = p.getInt("socksPort")
+        val xrayPort = p.optJSONObject("runtime")?.optJSONArray("xray_ports")?.optInt(0, 0) ?: 0
         val deadline = System.currentTimeMillis() + 10_000
         while (true) {
             procs.forEachIndexed { i, proc ->
@@ -242,7 +248,7 @@ class TunnelkaVpnService : VpnService() {
                     error("$name завершилось при запуске${lastLine(log)}")
                 }
             }
-            if (portOpen(port)) break
+            if (portOpen(port) && (xrayPort <= 0 || portOpen(xrayPort))) break
             if (System.currentTimeMillis() > deadline) error("ядро не ответило за 10 секунд")
             Thread.sleep(50)
         }
@@ -697,12 +703,15 @@ class TunnelkaVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        val self = this
         worker.execute {
             stopInternal()
-            if (state != State.STOPPED) state = State.STOPPED
-            updateTile()
+            if (activeService === self) {
+                activeService = null
+                if (state != State.STOPPED) state = State.STOPPED
+                updateTile()
+            }
         }
-        worker.shutdown()
         super.onDestroy()
     }
 
