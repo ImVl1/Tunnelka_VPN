@@ -184,8 +184,14 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         Thread {
             val pm = activity.packageManager
             val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-            val list = pm.queryIntentActivities(launcher, 0)
-                .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+            val flags = android.content.pm.PackageManager.MATCH_DISABLED_COMPONENTS
+            val list = pm.queryIntentActivities(launcher, flags)
+                .map {
+                    val pkg = it.activityInfo.packageName
+                    val appLabel = pm.getApplicationLabel(it.activityInfo.applicationInfo).toString().trim()
+                    val actLabel = it.loadLabel(pm).toString().trim()
+                    pkg to (appLabel.ifEmpty { actLabel }.ifEmpty { pkg })
+                }
                 .filter { it.first != activity.packageName }
                 .distinctBy { it.first }
                 .sortedBy { it.second.lowercase() }

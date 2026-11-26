@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use crate::model::{AppMode, CoreChoice, Mode, Platform, Runtime, Server, Settings};
+use crate::model::{AppMode, CoreChoice, Mode, Platform, Runtime, Server, Settings, ROUTE_DIRECT};
 use crate::xray::{self, XrayEntry};
 
 pub const TAG_PROXY: &str = "proxy";
@@ -178,11 +178,33 @@ impl Matchers {
 }
 
 fn as_cidr(e: &str) -> Option<String> {
-    let (ip, mask) = match e.split_once('/') {
+    let mut s = e.trim();
+    if let Some((_, rest)) = s.split_once("://") {
+        s = rest.split(['/', '?', '#']).next().unwrap_or("");
+        s = s.rsplit('@').next().unwrap_or(s);
+    }
+    let (ip, mask) = match s.split_once('/') {
         Some((a, b)) => (a, Some(b)),
-        None => (e, None),
+        None => (s, None),
     };
-    let addr: std::net::IpAddr = ip.trim_matches(|c| c == '[' || c == ']').parse().ok()?;
+    let ip_str = if let Some(v6) = ip.strip_prefix('[') {
+        let (inner, rest) = v6.split_once(']')?;
+        if !rest.is_empty() && !rest.starts_with(':') {
+            return None;
+        }
+        inner
+    } else if ip.parse::<std::net::IpAddr>().is_ok() {
+        ip
+    } else if let Some((h, port)) = ip.split_once(':') {
+        if !h.contains(':') && port.parse::<u16>().is_ok() {
+            h
+        } else {
+            ip
+        }
+    } else {
+        ip
+    };
+    let addr: std::net::IpAddr = ip_str.parse().ok()?;
     let max = if addr.is_ipv4() { 32 } else { 128 };
     let bits = match mask {
         Some(m) => m.parse::<u8>().ok().filter(|b| *b <= max)?,
@@ -564,7 +586,13 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         if fields.is_empty() {
             return Err("пустое имя приложения в индивидуальном правиле".into());
         }
-        if let Some(id) = rule.server.as_ref().filter(|id| tags.contains(id)) {
+        if rule.server.as_deref() == Some(ROUTE_DIRECT) {
+            let mut dns_match = fields.clone();
+            dns_match.insert("server".into(), json!("dns-direct"));
+            app_dns_rules.push(Value::Object(dns_match));
+            fields.insert("outbound".into(), json!(TAG_DIRECT));
+            pinned_rules.push(Value::Object(fields));
+        } else if let Some(id) = rule.server.as_ref().filter(|id| tags.contains(id)) {
             let dns_tag = format!("dns-app-{id}");
             if !app_dns_servers.iter().any(|s: &Value| s["tag"] == dns_tag) {
                 let (server, _) = dns_server(&dns_tag, &st.dns_remote, Some(id));
@@ -579,6 +607,47 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             // A removed server must never silently move an app to another exit.
             fields.insert("action".into(), json!("reject"));
             reject_rules.push(Value::Object(fields));
+        }
+    }
+    let mut site_route_rules = vec![];
+    let mut site_dns_rules = vec![];
+    for rule in &split.site_routes {
+        let m = Matchers::from_entries(std::slice::from_ref(&rule.site));
+        if m.is_empty(true) {
+            return Err(format!("некорректный адрес или IP в индивидуальном правиле: «{}»", rule.site));
+        }
+        if rule.server.as_deref() == Some(ROUTE_DIRECT) {
+            if !m.is_empty(false) {
+                let mut dns_match = m.fields(false);
+                dns_match.insert("server".into(), json!("dns-direct"));
+                site_dns_rules.push(Value::Object(dns_match));
+            }
+            let mut fields = m.fields(true);
+            fields.insert("outbound".into(), json!(TAG_DIRECT));
+            site_route_rules.push(Value::Object(fields));
+        } else if let Some(id) = rule.server.as_ref().filter(|id| tags.contains(id)) {
+            if !m.is_empty(false) {
+                let dns_tag = format!("dns-app-{id}");
+                if !app_dns_servers.iter().any(|s: &Value| s["tag"] == dns_tag) {
+                    let (server, _) = dns_server(&dns_tag, &st.dns_remote, Some(id));
+                    app_dns_servers.push(server);
+                }
+                let mut dns_match = m.fields(false);
+                dns_match.insert("server".into(), json!(dns_tag));
+                site_dns_rules.push(Value::Object(dns_match));
+            }
+            let mut fields = m.fields(true);
+            fields.insert("outbound".into(), json!(id));
+            site_route_rules.push(Value::Object(fields));
+        } else {
+            if !m.is_empty(false) {
+                let mut dns_match = m.fields(false);
+                dns_match.insert("action".into(), json!("reject"));
+                site_dns_rules.push(Value::Object(dns_match));
+            }
+            let mut fields = m.fields(true);
+            fields.insert("action".into(), json!("reject"));
+            site_route_rules.push(Value::Object(fields));
         }
     }
 
@@ -613,6 +682,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
             dns_rules.push(Value::Object(r));
         }
     }
+    dns_rules.extend(site_dns_rules);
     if !direct_m.is_empty(false) {
         let mut r = direct_m.fields(false);
         r.insert("server".into(), json!("dns-direct"));
@@ -711,6 +781,7 @@ pub fn build(input: &BuildInput) -> Result<Built, String> {
         rules.push(json!({"process_name": [input.xray_process.unwrap()], "outbound": TAG_DIRECT}));
     }
     rules.extend(pinned_rules);
+    rules.extend(site_route_rules);
     rules.push(json!({"ip_is_private": true, "outbound": TAG_DIRECT}));
     if !direct_m.is_empty(true) {
         let mut r = direct_m.fields(true);
@@ -893,6 +964,7 @@ mod tests {
             AppRoute { app: "game".into(), server: None },
             AppRoute { app: "reader".into(), server: Some(servers[1].id.clone()) },
             AppRoute { app: "stale".into(), server: Some("deleted".into()) },
+            AppRoute { app: "bank".into(), server: Some(ROUTE_DIRECT.into()) },
         ];
         let mut runtime = rt();
         runtime.mixed_port = 12345;
@@ -904,21 +976,76 @@ mod tests {
             let rules = cfg["route"]["rules"].as_array().unwrap();
             let android = platform == Platform::Android;
             let field = if android { "auth_user" } else { "process_name" };
-            let app = |i: usize| if android { ["app-1", "app-2", "app-3"][i] } else { ["game", "reader", "stale"][i] };
+            let app = |i: usize| {
+                if android {
+                    ["app-1", "app-2", "app-3", "app-4"][i]
+                } else {
+                    ["game", "reader", "stale", "bank"][i]
+                }
+            };
             let position = |key: &str, value: &str| rules.iter().position(|r| r[key] == value).unwrap();
             for index in [0, 2] {
                 assert!(rules[..position("action", "sniff")].iter().any(|r| r[field][0] == app(index) && r["action"] == "reject"));
             }
             let pin = position("outbound", &servers[1].id);
             assert_eq!(rules[pin][field][0], app(1));
-            assert!(pin < position("outbound", TAG_DIRECT));
+            let direct_pin = rules.iter().position(|r| r[field][0] == app(3) && r["outbound"] == TAG_DIRECT).unwrap();
+            let private_ip = rules.iter().position(|r| r["ip_is_private"] == true).unwrap();
+            assert!(pin < private_ip);
+            assert!(direct_pin < private_ip);
             assert_eq!(cfg["dns"]["rules"][0][field][0], app(1));
+            assert_eq!(cfg["dns"]["rules"][1][field][0], app(3));
+            assert_eq!(cfg["dns"]["rules"][1]["server"], "dns-direct");
             if android {
                 assert_eq!(cfg["inbounds"][0]["users"][2]["username"], "app-2");
+                assert_eq!(cfg["inbounds"][0]["users"][4]["username"], "app-4");
             } else {
                 params.mode = Mode::Proxy;
                 assert!(build(&params).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn individual_site_and_ip_routes() {
+        use crate::model::SiteRoute;
+        let servers = servers();
+        let mut st = Settings::default();
+        st.split.proxy_domains = vec!["openai.com".into(), "1.1.1.1".into()];
+        st.split.site_routes = vec![
+            SiteRoute { site: "https://www.openai.com/chat?q=1".into(), server: Some(servers[1].id.clone()) },
+            SiteRoute { site: "http://1.1.1.1:8080/test".into(), server: Some(ROUTE_DIRECT.into()) },
+            SiteRoute { site: "ads.example.com".into(), server: None },
+            SiteRoute { site: "10.8.0.0/24".into(), server: Some(servers[1].id.clone()) },
+            SiteRoute { site: "stale.example.com".into(), server: Some("deleted".into()) },
+        ];
+        let mut runtime = rt();
+        runtime.mixed_port = 12345;
+        for mode in [Mode::Tun, Mode::Proxy] {
+            let mut params = input(&st, &servers, &servers[0].id, &runtime);
+            params.mode = mode;
+            let cfg = build(&params).unwrap().singbox;
+            let rules = cfg["route"]["rules"].as_array().unwrap();
+            let dns_rules = cfg["dns"]["rules"].as_array().unwrap();
+            let sniff_pos = rules.iter().position(|r| r["action"] == "sniff").unwrap();
+            let priv_pos = rules.iter().position(|r| r["ip_is_private"] == true).unwrap();
+
+            let pin_site = rules.iter().position(|r| r["domain_suffix"][0] == "openai.com" && r["outbound"] == servers[1].id).unwrap();
+            let direct_ip = rules.iter().position(|r| r["ip_cidr"][0] == "1.1.1.1/32" && r["outbound"] == TAG_DIRECT).unwrap();
+            let block_site = rules.iter().position(|r| r["domain_suffix"][0] == "ads.example.com" && r["action"] == "reject").unwrap();
+            let pin_subnet = rules.iter().position(|r| r["ip_cidr"][0] == "10.8.0.0/24" && r["outbound"] == servers[1].id).unwrap();
+            let stale_site = rules.iter().position(|r| r["domain_suffix"][0] == "stale.example.com" && r["action"] == "reject").unwrap();
+
+            for pos in [pin_site, direct_ip, block_site, pin_subnet, stale_site] {
+                assert!(pos > sniff_pos);
+                assert!(pos < priv_pos);
+            }
+            assert_eq!(dns_rules[0]["domain_suffix"][0], "openai.com");
+            assert_eq!(dns_rules[0]["server"], format!("dns-app-{}", servers[1].id));
+            assert_eq!(dns_rules[1]["domain_suffix"][0], "ads.example.com");
+            assert_eq!(dns_rules[1]["action"], "reject");
+            assert_eq!(dns_rules[2]["domain_suffix"][0], "stale.example.com");
+            assert_eq!(dns_rules[2]["action"], "reject");
         }
     }
 

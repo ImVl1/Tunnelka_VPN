@@ -573,13 +573,62 @@ const APP_TEXT = {
   },
 };
 
-let appLabels = {};  // id → название (для Android)
+const APP_LABELS_KEY = "tunnelka.app-labels.v1";
+const ROUTE_DIRECT = "direct";
+let appLabels = (() => {
+  try { return JSON.parse(localStorage.getItem(APP_LABELS_KEY) || "{}") || {}; }
+  catch { return {}; }
+})();
+let appLabelsLoading = false;
+let appLabelsLoadedOnce = false;
+
+function saveAppLabels(list) {
+  let changed = false;
+  for (const p of list) {
+    if (p?.id && p?.label && p.label !== p.id && appLabels[p.id] !== p.label) {
+      appLabels[p.id] = p.label;
+      changed = true;
+    }
+  }
+  if (changed) {
+    try { localStorage.setItem(APP_LABELS_KEY, JSON.stringify(appLabels)); } catch { /* */ }
+  }
+  return changed;
+}
+
+async function ensureAppLabels(force = false) {
+  if (!isAndroid() || appLabelsLoading) return;
+  if (!force && appLabelsLoadedOnce) {
+    const split = splitDraft ?? settingsEdits.split ?? data?.settings?.split;
+    if (!split) return;
+    const all = [
+      ...(split.apps_include || []),
+      ...(split.apps_exclude || []),
+      ...(split.app_routes || []).map(r => r.app),
+    ];
+    if (all.every(id => appLabels[id])) return;
+  }
+  appLabelsLoading = true;
+  try {
+    const list = await invoke("list_apps");
+    appLabelsLoadedOnce = true;
+    if (saveAppLabels(list) && view === "split") renderSplit();
+  } catch { /* */ }
+  finally { appLabelsLoading = false; }
+}
 
 function renderSplit() {
   if (!splitDraft) splitDraft = structuredClone(settingsEdits.split ?? data.settings.split);
+  splitDraft.app_routes ??= [];
+  splitDraft.site_routes ??= [];
+  if (isAndroid()) ensureAppLabels();
   const t = APP_TEXT[platform];
   renderAppRoutes();
-  $("#route-app").placeholder = t.placeholder;
+  $("#route-app").placeholder = isAndroid()
+    ? "Сайт, ссылка или IP (youtube.com, 1.1.1.1)"
+    : "Сайт, ссылка, IP или программа (youtube.com, 1.1.1.1, chrome.exe)";
+  $("#route-add").textContent = isAndroid() ? "Добавить адрес" : "Добавить правило";
+  $("#route-pick").textContent = t.pick;
   $$("#app-mode input").forEach((i) => (i.checked = i.value === splitDraft.app_mode));
   const off = splitDraft.app_mode === "off";
   $("#apps-box").hidden = off;
@@ -618,7 +667,18 @@ function removeApp(name) {
 $("#app-add").onclick = () => { addApp($("#app-input").value); $("#app-input").value = ""; splitChanged(); };
 $("#app-input").onkeydown = (e) => { if (e.key === "Enter") $("#app-add").click(); };
 
+let editingRoute = null; // { kind: "app" | "site", idx: number }
+
+function routeDestInfo(serverId, servers) {
+  if (serverId === ROUTE_DIRECT) return { dest: "Без VPN · напрямую", cls: "direct" };
+  if (!serverId) return { dest: "Без интернета", cls: "blocked" };
+  if (servers.has(serverId)) return { dest: servers.get(serverId), cls: "" };
+  return { dest: "Сервер недоступен · без интернета", cls: "blocked" };
+}
+
 function renderAppRoutes() {
+  splitDraft.app_routes ??= [];
+  splitDraft.site_routes ??= [];
   const servers = new Map();
   for (const sub of data.subscriptions) {
     for (const server of sub.servers) {
@@ -626,18 +686,44 @@ function renderAppRoutes() {
     }
   }
   const select = $("#route-target");
-  if (!servers.has(select.value)) select.value = "";
-  select.querySelector("span").textContent = servers.get(select.value) ?? "Без интернета";
-  $("#app-routes").innerHTML = splitDraft.app_routes.map((r, i) => {
-    const dest = r.server ? servers.get(r.server) ?? "Сервер недоступен · без интернета" : "Без интернета";
-    const blocked = !r.server || !servers.has(r.server);
+  if (select.value !== ROUTE_DIRECT && !servers.has(select.value)) select.value = "";
+  select.querySelector("span").textContent = select.value === ROUTE_DIRECT
+    ? "Без VPN"
+    : (servers.get(select.value) ?? "Без интернета");
+  const items = [
+    ...splitDraft.app_routes.map((r, i) => ({
+      kind: "app", idx: i, title: appLabels[r.app] ?? r.app, raw: r.app, server: r.server, icon: "#i-app",
+    })),
+    ...splitDraft.site_routes.map((r, i) => ({
+      kind: "site", idx: i, title: r.site, raw: r.site, server: r.server, icon: "#i-globe",
+    })),
+  ];
+  $("#app-routes").innerHTML = items.map(item => {
+    const { dest, cls } = routeDestInfo(item.server, servers);
     return `<div class="route-item">
-      <div class="route-text"><b title="${esc(r.app)}">${esc(appLabels[r.app] ?? r.app)}</b><small class="${blocked ? "blocked" : ""}">${esc(dest)}</small></div>
-      <button type="button" class="icon" data-i="${i}" title="Удалить правило" aria-label="Удалить правило">✕</button>
+      <svg class="route-kind" aria-hidden="true"><use href="${item.icon}" /></svg>
+      <div class="route-text"><b title="${esc(item.raw)}">${esc(item.title)}</b><small class="${cls}">${esc(dest)}</small></div>
+      <div class="route-actions">
+        <button type="button" class="icon" data-edit="${item.idx}" data-kind="${item.kind}" title="Изменить правило" aria-label="Изменить правило"><svg><use href="#i-edit" /></svg></button>
+        <button type="button" class="icon" data-del="${item.idx}" data-kind="${item.kind}" title="Удалить правило" aria-label="Удалить правило">✕</button>
+      </div>
     </div>`;
   }).join("");
-  $$("#app-routes button").forEach(b => b.onclick = () => {
-    splitDraft.app_routes.splice(+b.dataset.i, 1);
+  $$("#app-routes [data-edit]").forEach(b => b.onclick = () => {
+    const kind = b.dataset.kind;
+    const idx = +b.dataset.edit;
+    const list = kind === "site" ? splitDraft.site_routes : splitDraft.app_routes;
+    const rule = list[idx];
+    if (!rule) return;
+    editingRoute = { kind, idx };
+    $("#target-title").textContent = kind === "site" ? rule.site : (appLabels[rule.app] ?? rule.app);
+    $("#target-search").value = "";
+    renderTargetList();
+    openPicker($("#target-dialog"));
+  });
+  $$("#app-routes [data-del]").forEach(b => b.onclick = () => {
+    const list = b.dataset.kind === "site" ? splitDraft.site_routes : splitDraft.app_routes;
+    list.splice(+b.dataset.del, 1);
     splitChanged();
   });
 }
@@ -675,12 +761,22 @@ $$("dialog").forEach(dialog => dialog.addEventListener("mousedown", e => {
   }
 }));
 
+function editingRouteValue() {
+  if (!editingRoute) return $("#route-target").value;
+  const list = editingRoute.kind === "site" ? splitDraft.site_routes : splitDraft.app_routes;
+  return list[editingRoute.idx]?.server ?? "";
+}
+
 function renderTargetList() {
   const query = $("#target-search").value.trim();
-  const target = $("#route-target").value;
+  const q = query.toLowerCase();
+  const target = editingRouteValue();
   const groups = [];
-  if (!query || "без интернета".includes(query.toLowerCase())) {
-    groups.push(`<button type="button" data-target="" aria-pressed="${!target}">Без интернета</button>`);
+  if (!q || "без vpn впн напрямую".includes(q)) {
+    groups.push(`<button type="button" data-target="${ROUTE_DIRECT}" aria-pressed="${target === ROUTE_DIRECT}"><span>Без VPN</span><small>напрямую</small></button>`);
+  }
+  if (!q || "без интернета блокировать".includes(q)) {
+    groups.push(`<button type="button" data-target="" aria-pressed="${!target}"><span>Без интернета</span><small>блокировать</small></button>`);
   }
   for (const sub of data.subscriptions) {
     const matches = matchingServers(sub, query).filter(server => server.outbound || server.xray);
@@ -692,7 +788,10 @@ function renderTargetList() {
   }
   $("#target-list").innerHTML = groups.join("") || '<div class="empty">Серверы не найдены</div>';
 }
+$("#target-dialog").addEventListener("close", () => { editingRoute = null; });
 $("#route-target").onclick = () => {
+  editingRoute = null;
+  $("#target-title").textContent = "Доступ к интернету";
   $("#target-search").value = "";
   renderTargetList();
   openPicker($("#target-dialog"));
@@ -701,21 +800,115 @@ $("#target-search").oninput = renderTargetList;
 $("#target-list").onclick = e => {
   const button = e.target.closest("[data-target]");
   if (!button) return;
-  $("#route-target").value = button.dataset.target;
-  renderAppRoutes();
+  const val = button.dataset.target;
+  if (editingRoute) {
+    const list = editingRoute.kind === "site" ? splitDraft.site_routes : splitDraft.app_routes;
+    if (list[editingRoute.idx]) list[editingRoute.idx].server = val || null;
+    editingRoute = null;
+    splitChanged();
+  } else {
+    $("#route-target").value = val;
+    renderAppRoutes();
+  }
   closePicker($("#target-dialog"));
 };
 
+function isWindowsAppEntry(raw) {
+  const s = raw.trim().replace(/^"+|"+$/g, "");
+  if (!s || /^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return false;
+  if (/^(full|keyword|regexp):/i.test(s)) return false;
+  return s.includes("\\") || /^[a-z]:\//i.test(s) || /\.exe$/i.test(s);
+}
+
+function normalizeSiteEntry(raw) {
+  let s = raw.trim();
+  if (!s || s.startsWith("#") || s.startsWith("//")) return null;
+  if (/^regexp:.+/i.test(s)) return "regexp:" + s.slice(7);
+  if (/^keyword:.+/i.test(s)) return "keyword:" + s.slice(8).toLowerCase();
+  if (/^full:.+/i.test(s)) return "full:" + s.slice(5).toLowerCase();
+
+  const hasScheme = s.includes("://");
+  let body = hasScheme ? s.slice(s.indexOf("://") + 3) : s;
+  if (hasScheme) {
+    body = body.split(/[/?#]/)[0];
+    const at = body.lastIndexOf("@");
+    if (at >= 0) body = body.slice(at + 1);
+  }
+
+  const slashIdx = body.indexOf("/");
+  const hostPart = slashIdx >= 0 ? body.slice(0, slashIdx) : body;
+  const maskPart = slashIdx >= 0 ? body.slice(slashIdx + 1) : null;
+  if (maskPart === null || /^\d{1,3}$/.test(maskPart)) {
+    let ipCandidate = hostPart;
+    if (ipCandidate.startsWith("[") && ipCandidate.includes("]")) {
+      const end = ipCandidate.indexOf("]");
+      const tail = ipCandidate.slice(end + 1);
+      if (!tail || /^:\d{1,5}$/.test(tail)) ipCandidate = ipCandidate.slice(1, end);
+    } else if (/^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(ipCandidate)) {
+      ipCandidate = ipCandidate.split(":")[0];
+    }
+    const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(ipCandidate)
+      && ipCandidate.split(".").every(n => +n >= 0 && +n <= 255);
+    const v6 = ipCandidate.includes(":") && /^[0-9a-fA-F:]+$/.test(ipCandidate);
+    if (v4 || v6) {
+      const maxBits = v4 ? 32 : 128;
+      if (maskPart !== null) {
+        const bits = +maskPart;
+        if (bits < 0 || bits > maxBits) return null;
+        return `${ipCandidate.toLowerCase()}/${bits}`;
+      }
+      return ipCandidate.toLowerCase();
+    }
+  }
+
+  let h = body.split(/[/?#]/)[0];
+  const at = h.lastIndexOf("@");
+  if (at >= 0) h = h.slice(at + 1);
+  if (h.startsWith("[")) return null;
+  h = h.split(":")[0].toLowerCase();
+  const wildcard = h.startsWith("*.") || h.startsWith(".");
+  h = h.replace(/^[*.]+/, "").replace(/\.+$/, "");
+  if (hasScheme && h.startsWith("www.") && h.slice(4).includes(".")) {
+    h = h.slice(4);
+  }
+  if (!h || /^[\d.]+$/.test(h)) return null;
+  if (!/^[\p{L}\p{N}._-]+$/u.test(h)) return null;
+  return wildcard ? `*.${h}` : h;
+}
+
 function setAppRoute(app) {
-  app = app.trim();
+  app = app.trim().replace(/^"+|"+$/g, "");
   if (!app) return;
   const server = $("#route-target").value || null;
   const existing = splitDraft.app_routes.find(r => r.app.toLowerCase() === app.toLowerCase());
   if (existing) existing.server = server;
   else splitDraft.app_routes.push({ app, server });
 }
+
+function setSiteRoute(site) {
+  const server = $("#route-target").value || null;
+  splitDraft.site_routes ??= [];
+  const existing = splitDraft.site_routes.find(r => r.site.toLowerCase() === site.toLowerCase());
+  if (existing) existing.server = server;
+  else splitDraft.site_routes.push({ site, server });
+}
+
 $("#route-add").onclick = () => {
-  setAppRoute($("#route-app").value);
+  const raw = $("#route-app").value.trim();
+  if (!raw) return;
+  if (!isAndroid() && isWindowsAppEntry(raw)) {
+    setAppRoute(raw);
+    $("#route-app").value = "";
+    splitChanged();
+    return;
+  }
+  const tokens = /^regexp:/i.test(raw) ? [raw] : raw.split(/[\r\n,;\s]+/).filter(Boolean);
+  const parsed = tokens.map(normalizeSiteEntry).filter(Boolean);
+  if (!parsed.length) {
+    toast("Укажите корректный сайт, ссылку или IP-адрес", true);
+    return;
+  }
+  for (const site of parsed) setSiteRoute(site);
   $("#route-app").value = "";
   splitChanged();
 };
@@ -758,7 +951,7 @@ async function openAppPicker(routes) {
     const list = await call("list_apps");
     if (!dialog.open || request !== appRequest) return;
     procs = list;
-    for (const p of procs) appLabels[p.id] = p.label;
+    saveAppLabels(procs);
     renderProcs();
   } catch {
     if (dialog.open && request === appRequest) dialog.close();
@@ -1129,6 +1322,7 @@ function render() {
     window.__TAURI__?.app?.getVersion?.().then((v) => ($("#app-version").textContent = v)).catch(() => {});
     await reload();
     resumeChanges();
+    ensureAppLabels(true);
   } catch (e) {
     toast(String(e), true);
   }

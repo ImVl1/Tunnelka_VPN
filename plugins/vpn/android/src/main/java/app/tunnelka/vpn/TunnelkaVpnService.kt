@@ -322,17 +322,28 @@ class TunnelkaVpnService : VpnService() {
         }
 
         val routes = p.optJSONArray("appRoutes") ?: JSONArray()
-        val packages = (0 until routes.length()).map { routes.getJSONObject(it).getString("app") }
-        if (packages.isNotEmpty()) {
+        val directPackages = mutableSetOf<String>()
+        val tunPackages = mutableListOf<String>()
+        for (i in 0 until routes.length()) {
+            val r = routes.getJSONObject(i)
+            val pkg = r.getString("app")
+            require(pkg != packageName) { "Нельзя назначить правило самой Tunnelka" }
+            if (!r.isNull("server") && r.getString("server") == "direct") {
+                directPackages.add(pkg)
+            } else {
+                tunPackages.add(pkg)
+            }
+        }
+        if (tunPackages.isNotEmpty()) {
             require(Build.VERSION.SDK_INT >= 29) { "Индивидуальные правила требуют Android 10 или новее" }
             appRouter = AppRouter(this, routes)
         }
-        val selected = when (appMode) {
-            "include" -> apps + packages
-            "exclude" -> apps.filter { appRouter?.covers(it) != true }
-            else -> apps
-        }.distinct().filter { it.isNotEmpty() && it != packageName }
-        if (appMode == "include" && selected.isNotEmpty()) {
+        if (appMode == "include") {
+            val selected = (apps + tunPackages)
+                .filter { it !in directPackages }
+                .distinct()
+                .filter { it.isNotEmpty() && it != packageName }
+            require(selected.isNotEmpty()) { "Все выбранные приложения исключены правилом «Без VPN»" }
             var added = 0
             for (a in selected) {
                 try {
@@ -344,12 +355,13 @@ class TunnelkaVpnService : VpnService() {
         } else {
             // Ядра работают в процессах этого приложения — исключаем его из VPN.
             builder.addDisallowedApplication(packageName)
-            if (appMode == "exclude") {
-                for (a in selected) {
-                    try {
-                        builder.addDisallowedApplication(a)
-                    } catch (_: PackageManager.NameNotFoundException) {
-                    }
+            val disallowed = ((if (appMode == "exclude") apps.filter { appRouter?.covers(it) != true } else emptyList()) + directPackages)
+                .distinct()
+                .filter { it.isNotEmpty() && it != packageName }
+            for (a in disallowed) {
+                try {
+                    builder.addDisallowedApplication(a)
+                } catch (_: PackageManager.NameNotFoundException) {
                 }
             }
         }

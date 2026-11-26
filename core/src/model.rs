@@ -152,10 +152,23 @@ pub enum CoreChoice {
     Xray,
 }
 
+/// Специальное значение `AppRoute::server` для обхода VPN напрямую.
+pub const ROUTE_DIRECT: &str = "direct";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppRoute {
     pub app: String,
-    /// None blocks the app. Otherwise the value is a stable server ID.
+    /// `None` блокирует доступ в сеть, `Some("direct")` пускает напрямую мимо VPN,
+    /// иначе — стабильный ID сервера.
+    pub server: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SiteRoute {
+    /// Домен, ссылка (`https://...`), маска (`*.ru`), IP или подсеть (`1.2.3.4/24`).
+    pub site: String,
+    /// `None` блокирует доступ в сеть, `Some("direct")` пускает напрямую мимо VPN,
+    /// иначе — стабильный ID сервера.
     pub server: Option<String>,
 }
 
@@ -163,6 +176,8 @@ pub struct AppRoute {
 pub struct SplitTunnel {
     #[serde(default)]
     pub app_routes: Vec<AppRoute>,
+    #[serde(default)]
+    pub site_routes: Vec<SiteRoute>,
     #[serde(default)]
     pub app_mode: AppMode,
     /// Приложения для режима «через VPN только выбранные».
@@ -192,6 +207,7 @@ impl Default for SplitTunnel {
         Self {
             app_mode: AppMode::Off,
             app_routes: vec![],
+            site_routes: vec![],
             apps_include: vec![],
             apps_exclude: vec![],
             apps: vec![],
@@ -209,6 +225,11 @@ impl SplitTunnel {
         self.app_routes.retain_mut(|rule| {
             rule.app = rule.app.trim().to_string();
             !rule.app.is_empty() && seen.insert(rule.app.to_lowercase())
+        });
+        let mut seen_sites = std::collections::HashSet::new();
+        self.site_routes.retain_mut(|rule| {
+            rule.site = rule.site.trim().to_string();
+            !rule.site.is_empty() && seen_sites.insert(rule.site.to_lowercase())
         });
         if !self.apps.is_empty() {
             let old = std::mem::take(&mut self.apps);

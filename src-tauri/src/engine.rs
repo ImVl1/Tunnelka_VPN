@@ -2627,6 +2627,7 @@ impl Engine {
             settings.log_level = "error".into();
             settings.split.app_mode = AppMode::Off;
             settings.split.app_routes.clear();
+            settings.split.site_routes.clear();
             let refs: Vec<&Server> = servers.iter().collect();
             let n_xray = if self.paths.xray.exists() { singbox::xray_count(&refs, &settings) } else { 0 };
             let mut ports = free_ports(2 + n_xray)?;

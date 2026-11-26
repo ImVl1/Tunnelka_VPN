@@ -635,8 +635,8 @@ body.p-android .row.android-only { display: flex; }
 }
 .settings-panel .setting-link:hover:enabled { border-color: var(--line-2); background: rgba(255,255,255,.055); }
 .settings-panel .setting-link:active:enabled { transform: translateY(1px); }
-.settings-panel .android-only { padding: 12px 0 14px; border-top: 1px solid var(--line); }
-.settings-panel .android-only > .hint:first-child { margin-top: 0; }
+.settings-panel .block > .android-only { padding: 12px 0 14px; border-top: 1px solid var(--line); }
+.settings-panel .block > .android-only > .hint:first-child { margin-top: 0; }
 .settings-panel .form label { min-width: 0; }
 .settings-panel #lan-info { padding-left: 0; }
 #view-settings .view-head, #view-split .view-head { align-items: center; }
@@ -650,15 +650,19 @@ main { min-width: 0; }
 #app-routes { display: flex; flex-direction: column; gap: 6px; margin-top: var(--s-3); }
 #app-routes:empty { display: none; }
 .route-item {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 10px 12px 10px 14px; border-radius: var(--r-s);
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 10px 10px 12px; border-radius: var(--r-s);
   border: 1px solid var(--line); background: rgba(255, 255, 255, .026);
 }
+.route-kind { width: 17px; height: 17px; flex: none; fill: none; stroke: var(--dim); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .route-text { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .route-text b { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .route-text small { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
 .route-text small.blocked { color: var(--warn); }
-.route-item .icon:not(:disabled):hover { color: var(--bad); background: rgba(248, 113, 113, .1); }
+.route-text small.direct { color: var(--good); }
+.route-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.route-actions [data-edit] svg { width: 16px; height: 16px; stroke-width: 2; }
+.route-item [data-del]:not(:disabled):hover { color: var(--bad); background: rgba(248, 113, 113, .1); }
 .chip { max-width: 100%; height: auto; min-height: 30px; overflow-wrap: anywhere; }
 .chip button { flex-shrink: 0; }
 @media (max-width: 700px) {
@@ -667,6 +671,10 @@ main { min-width: 0; }
   .settings-categories { display: flex; }
   .settings-categories button { flex: 1; min-width: 0; min-height: 42px; }
   .settings-panel h3 { font-size: 16px; }
+  .block.about { padding: var(--s-4) 0 0; }
+  .block.about h3 { padding-left: var(--s-4); }
+  .about-link { padding-left: var(--s-4); padding-right: 42px; }
+  .about-link .go { right: var(--s-4); }
   .settings-panel .about-link small { overflow-wrap: anywhere; }
   #view-settings .head-actions { gap: 5px; }
   #view-settings .head-actions .btn.primary { padding: 0 12px; }
@@ -680,9 +688,13 @@ main { min-width: 0; }
 .picker-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .picker-head h3 { margin: 0; }
 .picker-back svg { transform: rotate(180deg); }
-.btn.target-trigger { flex: 1 1 220px; max-width: 100%; height: auto; min-height: var(--h-md); padding-top: 8px; padding-bottom: 8px; justify-content: space-between; }
+.btn.target-trigger { flex: 0 1 300px; min-width: 190px; max-width: 100%; height: var(--h-md); justify-content: space-between; }
 .target-trigger span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; line-height: 1.35; }
 .target-trigger svg { flex: none; }
+@media (max-width: 700px) {
+  .block > .row input { flex: none; width: 100%; min-width: 0; height: var(--h-md); }
+  .btn.target-trigger { flex: none; width: 100%; min-width: 0; height: var(--h-md); }
+}
 .target-list { margin-top: 12px; max-height: min(55vh, 440px); overflow: auto; border: 1px solid var(--line); border-radius: var(--r-s); padding: 4px; background: rgba(0, 0, 0, .2); }
 .target-list details { border-top: 1px solid var(--line); }
 .target-list details:first-child, .target-list button + details:first-of-type { border-top: 1px solid var(--line); }
